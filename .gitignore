@@ -1,0 +1,23 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+dist/
+build/
+
+# --- Tools ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --- Environment and secrets ---
+.env
+.env.*
+
+# --- BGL local state ---
+# Lock files are machine-local. Never commit them.
+# Any project that uses bgl needs this line too; `bgl init` will add it.
+.bgl/
