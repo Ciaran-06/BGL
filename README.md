@@ -8,7 +8,7 @@ BGL makes every backtest run in a project logged, budgeted and tamper-evident. E
 
 ```bash
 pip install bgl          # or: uv add bgl
-bgl init                 # writes bgl.toml and an empty ledger
+bgl init                 # writes bgl.toml, an empty ledger and scratch/
 ```
 
 ```python
@@ -19,6 +19,10 @@ with start_run(study="equities", run_type="diagnostic", script=__file__,
     ...
     run.result("...")
 ```
+
+## Common refusals
+
+- **`Refused (R3b): untracked Python files`**: new `.py` files must be committed, or moved to `scratch/`, which git ignores.
 
 ## What it does not do
 
@@ -35,7 +39,7 @@ with start_run(study="equities", run_type="diagnostic", script=__file__,
 
 ## Design
 
-The design spec is the source of truth: [link to the spec doc]. Decisions and open questions are in its tables.
+The design spec is the source of truth: [docs/SPEC.md](docs/SPEC.md). Decisions and open questions are in its tables.
 
 ## Development
 
