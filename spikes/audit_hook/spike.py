@@ -107,9 +107,11 @@ def make_data(folder: Path) -> dict[str, Path]:
     }
     files["csv"].write_text("a,b\n1,2\n3,4\n")
     files["txt"].write_text("hello\n")
-    with sqlite3.connect(files["sqlite"]) as con:
+    con = sqlite3.connect(files["sqlite"])
+    with con:
         con.execute("create table t (x)")
         con.execute("insert into t values (1)")
+    con.close()  # "with" commits but does not close; Windows then locks the file
     try:
         import numpy as np
 
@@ -317,7 +319,9 @@ def worker_cases(files: dict[str, Path]) -> list[dict[str, object]]:
 
 def main() -> None:
     print(f"Python {sys.version.split()[0]} on {sys.platform}\n")
-    with tempfile.TemporaryDirectory() as tmp:
+    # The sqlite case leaves a connection open in this process; on Windows the
+    # file stays locked, so cleanup errors must not hide the printed results.
+    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
         folder = Path(tmp)
         files = make_data(folder)
         print("## File reads\n")

@@ -179,3 +179,53 @@ def test_dishonest_log_accepting_a_bad_signature_is_caught(
     )
     with pytest.raises(WitnessError, match="SSH signature"):
         rekor.check_record(record, PUBLIC)
+
+
+class TestKeyMatches:
+    """Rekor stores its own key text, so the key is compared, never the text."""
+
+    PUBLIC = KEY.public_key().public_bytes_raw()
+
+    @staticmethod
+    def content(text: str) -> str:
+        return base64.b64encode(text.encode()).decode()
+
+    def line(self) -> str:
+        from bgl import sshsig
+
+        return sshsig.authorized_key(self.PUBLIC)
+
+    @pytest.mark.parametrize("suffix", ["", "\n", " a comment", " a comment\n", "\r\n"])
+    def test_same_key_in_any_text_form(self, suffix: str) -> None:
+        assert rekor.key_matches(self.content(self.line() + suffix), self.PUBLIC)
+
+    def test_rekor_canonical_form_is_accepted(self) -> None:
+        # What rekor.sigstore.dev returned in the live test: Go's
+        # ssh.MarshalAuthorizedKey, which ends the line with a newline.
+        canonical = self.content(self.line() + "\n")
+        assert canonical != rekor.public_key_content(self.PUBLIC)
+        assert rekor.key_matches(canonical, self.PUBLIC)
+
+    def test_other_key_is_refused(self) -> None:
+        other = Ed25519PrivateKey.from_private_bytes(bytes([1]) * 32)
+        assert not rekor.key_matches(
+            self.content(self.line()), other.public_key().public_bytes_raw()
+        )
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            None,
+            5,
+            "",
+            "!!!",
+            base64.b64encode(b"ssh-ed25519").decode(),
+            base64.b64encode(b"ssh-rsa AAAA").decode(),
+        ],
+    )
+    def test_malformed_is_refused(self, content: object) -> None:
+        assert not rekor.key_matches(content, self.PUBLIC)
+
+    def test_wrong_key_type_label_is_refused(self) -> None:
+        line = self.line().replace("ssh-ed25519", "ssh-rsa", 1)
+        assert not rekor.key_matches(self.content(line), self.PUBLIC)

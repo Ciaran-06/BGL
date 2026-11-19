@@ -52,6 +52,23 @@ def public_key_content(public: bytes) -> str:
     return _b64(sshsig.authorized_key(public).encode("ascii"))
 
 
+def key_matches(content: object, public: bytes) -> bool:
+    """Does a stored publicKey.content name this Ed25519 key?
+
+    Rekor does not store the key text BGL sends. It stores its own canonical
+    form (Go's ssh.MarshalAuthorizedKey: comment dropped, newline added), so
+    compare the decoded key, never the text.
+    """
+    if not isinstance(content, str):
+        return False
+    try:
+        parts = base64.b64decode(content, validate=True).decode("ascii").split()
+        blob = base64.b64decode(parts[1], validate=True)
+    except (binascii.Error, UnicodeDecodeError, IndexError, ValueError):
+        return False
+    return parts[0] == "ssh-ed25519" and blob == sshsig.public_blob(public)
+
+
 def build_entry(private_key: Ed25519PrivateKey, head: str) -> dict[str, Any]:
     """The rekord entry proposing one head."""
     message = witness_message(head)
@@ -185,7 +202,7 @@ def check_body(entry: Mapping[str, Any], public: bytes) -> tuple[str, str]:
         raise WitnessError("the entry is not a rekord with an SSH signature") from None
     if kind != ("rekord", "0.0.1", "ssh"):
         raise WitnessError(f"unexpected entry kind {kind}")
-    if key_content != public_key_content(public):
+    if not key_matches(key_content, public):
         raise WitnessError("the entry was made with a different public key")
     if not isinstance(data_hash, dict) or data_hash.get("algorithm") != "sha256":
         raise WitnessError("the entry's data hash is not SHA-256")

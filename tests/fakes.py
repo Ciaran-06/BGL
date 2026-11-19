@@ -106,7 +106,7 @@ class FakeRekor(_Server):
         )
         self.bodies: list[bytes] = []
         self.entries: dict[str, dict[str, Any]] = {}
-        self.by_key: dict[str, list[str]] = {}
+        self.by_key: dict[bytes, list[str]] = {}
         self.offset = 5000  # global log index of this shard's first entry
         self.search_works = True
         self.check_signatures = True  # False: a dishonest log
@@ -159,7 +159,8 @@ class FakeRekor(_Server):
             if method == "POST" and path == "/api/v1/index/retrieve":
                 if not self.search_works:
                     return _json(404, {"message": "search disabled"})
-                key = request["publicKey"]["content"]
+                text = base64.b64decode(request["publicKey"]["content"]).decode()
+                key = base64.b64decode(text.split()[1])[-32:]
                 return _json(200, list(self.by_key.get(key, [])))
             if method == "POST" and path == "/api/v1/log/entries/retrieve":
                 found = []
@@ -174,7 +175,7 @@ class FakeRekor(_Server):
         spec = request["spec"]
         content = base64.b64decode(spec["data"]["content"])
         key_text = base64.b64decode(spec["signature"]["publicKey"]["content"]).decode()
-        blob = base64.b64decode(key_text.split(" ")[1])
+        blob = base64.b64decode(key_text.split()[1])
         public = blob[-32:]
         armored = base64.b64decode(spec["signature"]["content"]).decode()
         if self.check_signatures and not sshsig.verify(public, content, armored):
@@ -189,7 +190,16 @@ class FakeRekor(_Server):
                         "value": hashlib.sha256(content).hexdigest(),
                     }
                 },
-                "signature": spec["signature"],
+                # Real Rekor stores its canonical key text (ssh.MarshalAuthorizedKey:
+                # no comment, trailing newline), not the text it was sent.
+                "signature": {
+                    **spec["signature"],
+                    "publicKey": {
+                        "content": base64.b64encode(
+                            (sshsig.authorized_key(public) + "\n").encode()
+                        ).decode()
+                    },
+                },
             },
         }
         self.bodies.append(
@@ -197,9 +207,7 @@ class FakeRekor(_Server):
         )
         index = len(self.bodies) - 1
         uuid = self.uuid(index)
-        self.by_key.setdefault(spec["signature"]["publicKey"]["content"], []).append(
-            uuid
-        )
+        self.by_key.setdefault(public, []).append(uuid)
         return _json(201, {uuid: self._entry(index)})
 
     def add_entry_for(self, public: bytes, content: bytes, private: Any) -> str:
