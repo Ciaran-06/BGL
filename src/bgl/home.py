@@ -24,6 +24,8 @@ _KEY_BYTES: Final[int] = 32
 _FINGERPRINT_HEX: Final[int] = 16
 
 
+# [DECISION] Home folder per OS as below, overridable with BGL_HOME. No
+# platformdirs dependency.
 def home_dir() -> Path:
     """BGL's folder in the user's config area. BGL_HOME overrides it (tests use it).
 
@@ -47,6 +49,7 @@ def home_dir() -> Path:
 def create_machine_id(home: Path) -> str:
     """Create this machine's ID. Refuses if one already exists."""
     home.mkdir(parents=True, exist_ok=True)
+    # [DECISION] A machine ID is a random UUID4 as 32 lowercase hex characters.
     machine_id = uuid.uuid4().hex
     path = home / _MACHINE_ID_FILE
     try:
@@ -79,6 +82,8 @@ def key_fingerprint(public_key: bytes) -> str:
     return hashlib.sha256(public_key).hexdigest()[:_FINGERPRINT_HEX]
 
 
+# [DECISION] Key files are keys/<CODE>-<first 16 hex of SHA-256(public key)>.key,
+# holding the 32 raw private bytes, mode 0600.
 def private_key_path(home: Path, code: str, public_key: bytes) -> Path:
     """keys/<CODE>-<fingerprint>.key. The fingerprint keeps two projects that
     both use the code CG1 from colliding."""
@@ -103,6 +108,8 @@ def create_private_key(home: Path, code: str) -> Ed25519PrivateKey:
     return key
 
 
+# [DECISION] Loading never creates a missing key or machine ID; it raises and
+# names bgl join, so a wiped home folder fails loudly.
 def load_private_key(home: Path, writer: Writer) -> Ed25519PrivateKey:
     """Load the private key for a registered writer and check it matches (R19)."""
     path = private_key_path(home, writer.code, writer.public_key)

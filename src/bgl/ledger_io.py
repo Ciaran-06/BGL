@@ -54,6 +54,7 @@ def append_line(path: Path, line: bytes) -> None:
     """
     if not line.endswith(_NEWLINE) or _NEWLINE in line[:-1]:
         raise ValueError("append_line takes exactly one line ending in a newline")
+    # [DECISION] The first append creates the ledger folder and chain file.
     path.parent.mkdir(parents=True, exist_ok=True)
     is_new = not path.exists()
     with open(path, "ab") as handle:
@@ -77,6 +78,8 @@ def truncate_tail(path: Path, length: int) -> None:
         if length > size:
             raise ValueError(f"cannot remove {length} bytes from a {size}-byte file")
         handle.seek(size - length)
+        # [DECISION] Second guard for R14: never remove bytes holding a newline,
+        # even if the caller's length is wrong.
         if _NEWLINE in handle.read(length):
             raise ValueError("refusing to remove bytes that include a complete line")
         handle.truncate(size - length)

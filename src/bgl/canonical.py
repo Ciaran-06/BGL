@@ -24,6 +24,8 @@ def _check_value(value: object, path: str) -> None:
     """
     if value is None or isinstance(value, (bool, int, str)):
         return
+    # [DECISION] Tuples are accepted and written as lists (config records use
+    # tuples). Only plain dicts are accepted: json cannot write mappingproxy.
     if isinstance(value, (list, tuple)):
         for index, item in enumerate(value):
             _check_value(item, f"{path}[{index}]")

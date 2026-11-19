@@ -15,6 +15,8 @@ from typing import BinaryIO, Final
 from bgl.errors import LockTimeoutError
 
 LEDGER_LOCK: Final[str] = ".bgl/ledger.lock"
+# [DECISION] Wait up to 60 s for a lock, polling every 50 ms, then raise.
+# Locks are not reentrant.
 DEFAULT_TIMEOUT: Final[float] = 60.0
 _POLL_SECONDS: Final[float] = 0.05
 

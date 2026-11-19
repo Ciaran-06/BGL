@@ -43,6 +43,8 @@ def verify_row_signature(public_key: bytes, hash_hex: object, sig: object) -> bo
         raw = base64.b64decode(sig, validate=True)
     except (binascii.Error, ValueError):
         return False
+    # [DECISION] The signature text must be the exact encoding of its bytes, so
+    # each signature has one spelling (same rule as keys in C12).
     if len(raw) != SIGNATURE_BYTES or base64.b64encode(raw).decode("ascii") != sig:
         return False
     try:

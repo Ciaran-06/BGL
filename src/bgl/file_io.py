@@ -12,6 +12,7 @@ def fsync_dir(path: Path) -> None:
     Windows cannot open a folder for fsync; there, renames are already durable
     enough for NTFS, so this does nothing.
     """
+    # [DECISION] Windows cannot fsync a folder, so this is a no-op there.
     if sys.platform == "win32":
         return
     fd = os.open(path, os.O_RDONLY)
@@ -27,6 +28,7 @@ def atomic_write(path: Path, data: bytes) -> None:
     Writes a temporary file in the same folder, fsyncs it, renames it over path,
     then fsyncs the folder. The folder must already exist.
     """
+    # [DECISION] atomic_write never creates folders; the caller must.
     folder = path.parent
     fd, temp_name = tempfile.mkstemp(dir=folder, prefix=f".{path.name}.", suffix=".tmp")
     temp = Path(temp_name)
@@ -42,6 +44,7 @@ def atomic_write(path: Path, data: bytes) -> None:
     fsync_dir(folder)
 
 
+# [DECISION] Secrets and identities are created once and never overwritten.
 def create_exclusive(path: Path, data: bytes, *, mode: int = 0o600) -> None:
     """Create a new file holding data, refusing if it already exists.
 

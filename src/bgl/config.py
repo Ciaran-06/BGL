@@ -405,6 +405,8 @@ def check_https_url_list(
     return tuple(urls) if ok else None
 
 
+# [DECISION] An HTTPS URL here means: scheme https, a host, a valid port if
+# given, and no spaces or control characters. Nothing else is checked.
 def _url_problem(value: object) -> str | None:
     """Why value is not an acceptable HTTPS URL, or None if it is."""
     if not isinstance(value, str) or not value:
@@ -510,6 +512,8 @@ class Project:
 
     name: str
     mode: Mode
+    # [DECISION] Paths stay repository-relative strings; callers join them to
+    # the repository root.
     ledger: str
     runs_dir: str
     writers: Mapping[str, Writer]
@@ -517,6 +521,8 @@ class Project:
 
 
 @dataclasses.dataclass(frozen=True)
+# [DECISION] Partial project results, so a bad name does not hide C14/C15
+# errors in studies (spec: skip only dependent checks).
 class ProjectParts:
     """What check_project found. A field is None when its own check failed.
 
@@ -707,6 +713,8 @@ def check_witness(
     """
     path = key_path("project", "witness")
     value = project.get("witness")
+    # [DECISION] witness = false in a team project is reported as C17 (the rule
+    # that names it), not C14. With an invalid mode it is not reported at all.
     if value is False:
         if mode == "solo":
             return True, None
@@ -887,6 +895,8 @@ def check_studies(
     ok = True
     for name, table in studies.items():
         path = key_path("studies", name)
+        # [DECISION] A study with a bad name still has its contents checked.
+        # A study that is not a table is C1.
         name_ok = check_name(collector, name, path, "C1")
         if not isinstance(table, dict):
             collector.add("C1", "a study table", key=path, found=table)
@@ -894,6 +904,7 @@ def check_studies(
             continue
         prefix = check_prefix(collector, table, path)
         if prefix is not None:
+            # [DECISION] C6 is reported at the later study's prefix, in file order.
             first = prefixes.setdefault(prefix, name)
             if first != name:
                 collector.add(
@@ -996,6 +1007,7 @@ def check_claims(
     claims: list[str] = []
     ok = True
     for index, item in enumerate(value):
+        # [DECISION] Claim errors are reported per item (claims[i]), like paths.
         item_path = f"{claims_path}[{index}]"
         if not check_name(collector, item, item_path, "C5"):
             ok = False
@@ -1020,6 +1032,8 @@ def check_holdout(
     holdout_start and holdout, the files and custodian are not checked, because
     it is unknown which set of rules applies.
     """
+    # [DECISION] With both or neither of holdout_start and holdout, the files
+    # and custodian are not checked: which rules apply is unknown.
     has_start = "holdout_start" in study
     has_flag = "holdout" in study
     if has_start and has_flag:
@@ -1129,6 +1143,8 @@ def check_custodian(
     invalid mode it is not reported. The registry check is skipped when the
     registry is invalid.
     """
+    # [DECISION] A solo custodian, when given, is still checked against the
+    # registry. A missing custodian with an invalid mode is not reported.
     custodian_path = key_path(path, "custodian")
     if "custodian" not in study:
         if mode == "solo":
@@ -1203,6 +1219,8 @@ def _check_risk_free(
     collector: ErrorCollector, returns: Mapping[str, Any], returns_path: str
 ) -> tuple[bool, str | None, str | None]:
     """Returns (valid, risk_free path or None for "none", reasoning or None)."""
+    # [DECISION] A missing or non-text risk_free is C16 (not C2), and then
+    # risk_free_reasoning is not checked.
     value = returns.get("risk_free")
     if not isinstance(value, str) or not value:
         collector.add(
@@ -1400,6 +1418,8 @@ def canonical_study(study: Study) -> dict[str, Any]:
     give the same table. Keys are written as in bgl.toml; the study name is not
     included, because the lock row records it separately.
     """
+    # [DECISION] The study name is not in the canonical table (the lock row
+    # records it); custodian is left out when absent; risk_free "none" is text.
     table: dict[str, Any] = {
         "budget": study.budget,
         "prefix": study.prefix,

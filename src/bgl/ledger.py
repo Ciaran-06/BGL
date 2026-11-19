@@ -1,22 +1,31 @@
 """The ledger: building rows, and the verdicts on chains.
 
 verify_chain, append_row and repair_chain decide what counts as intact evidence
-and what may change it; they are written by hand against the spec (R7, R14, R15,
-R18). The rest is a direct translation of the spec's tables.
+and what may change it (R7, R14, R15, R18); review them most carefully. The rest
+is a direct translation of the spec's tables.
 """
 
 import dataclasses
+import hashlib
+import json
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from bgl.canonical import HASH_HEX, row_hash
+from bgl.canonical import GENESIS_HASH, HASH_HEX, line_bytes, row_hash
 from bgl.config import Project, Writer
-from bgl.ledger_io import chain_files, chain_path, read_chain
+from bgl.errors import ChainBrokenError, NothingToRepairError
+from bgl.ledger_io import (
+    append_line,
+    chain_files,
+    chain_path,
+    read_chain,
+    truncate_tail,
+)
 from bgl.locks import ledger_lock
-from bgl.signing import sign_row_hash
+from bgl.signing import sign_row_hash, verify_row_signature
 
 FORMAT_VERSION: Final[int] = 1
 EVENTS: Final[frozenset[str]] = frozenset(
@@ -98,6 +107,7 @@ ROW_FIELDS: Final[frozenset[str]] = frozenset(
         "sig",
     }
 )
+# [DECISION] Only build_row sets these, so a caller cannot fake them.
 BUILD_ONLY_FIELDS: Final[frozenset[str]] = frozenset(
     {"prev_hash", "hash", "sig", "format_version"}
 )
@@ -126,6 +136,8 @@ class ChainReport:
 
 
 @dataclasses.dataclass(frozen=True)
+# [DECISION] verify_all_chains returns every chain's report plus unregistered
+# chain files; ok means no problems and no strays.
 class LedgerReport:
     """Every registered chain's report, plus chain files outside the registry (N7)."""
 
@@ -172,8 +184,95 @@ def build_row(
 def verify_chain(
     lines: Sequence[bytes], torn_tail: bytes | None, writer: Writer
 ) -> ChainReport:
-    """Check one chain and report the first broken row. Written by hand."""
-    raise NotImplementedError("verify_chain is not written yet")
+    """Check one chain and report the first broken row (R7, R15, N6, N7).
+
+    Pure: no file access. lines are complete lines without their newline;
+    torn_tail is the bytes after the last newline, or None.
+    """
+    prev = GENESIS_HASH
+    good: list[dict[str, Any]] = []
+    first_machine: object = None
+
+    def fail(number: int, reason: str) -> ChainReport:
+        # head is prev: the last hash this function confirmed itself.
+        problem = ChainProblem(number, reason)
+        return ChainReport(writer.code, tuple(good), prev, problem)
+
+    # [DECISION] Check order: readable, canonical, fields, version, chain, link,
+    # hash, signature, machine. Structural checks first give specific reasons;
+    # link before hash names a removed row; hash before signature names an edit.
+    for number, line in enumerate(lines, start=1):
+        try:
+            text = line.decode("utf-8")
+        except UnicodeDecodeError:
+            return fail(number, "not UTF-8")
+        try:
+            row = json.loads(text)
+        except json.JSONDecodeError:
+            return fail(number, "not valid JSON")
+        if not isinstance(row, dict):
+            return fail(number, "not a JSON object")
+
+        try:
+            expected = line_bytes(row)
+        except ValueError:
+            return fail(number, "contains a float or other value that cannot be hashed")
+        if expected != line + b"\n":
+            return fail(number, "not in canonical form")
+
+        missing = sorted(ROW_FIELDS - row.keys())
+        extra = sorted(row.keys() - ROW_FIELDS)
+        if missing or extra:
+            parts = []
+            if missing:
+                parts.append("missing fields: " + ", ".join(missing))
+            if extra:
+                parts.append("extra fields: " + ", ".join(extra))
+            return fail(number, "; ".join(parts))
+
+        version = row["format_version"]
+        # type() rather than isinstance: True == 1 in Python.
+        if type(version) is not int or version != FORMAT_VERSION:
+            return fail(
+                number, f"format_version {version!r}, expected {FORMAT_VERSION}"
+            )
+        if row["chain"] != writer.code:
+            return fail(number, f"chain {row['chain']!r}, expected {writer.code}")
+        if row["prev_hash"] != prev:
+            return fail(
+                number,
+                "prev_hash does not match the previous row "
+                "(a row was removed, reordered or inserted)",
+            )
+        if row_hash(row) != row["hash"]:
+            return fail(
+                number, "hash does not match the row's contents (the row was edited)"
+            )
+        if not verify_row_signature(writer.public_key, row["hash"], row["sig"]):
+            return fail(number, f"signature does not verify with {writer.code}'s key")
+
+        machine = row["machine_id"]
+        if not isinstance(machine, str) or not machine:
+            return fail(number, "machine_id missing")
+        if number == 1:
+            first_machine = machine
+        elif machine != first_machine:
+            return fail(
+                number,
+                "machine_id differs from the first row's "
+                "(two machines writing one chain)",
+            )
+
+        good.append(row)
+        prev = row["hash"]  # equal to the hash computed above
+
+    if torn_tail is not None:
+        # ChainBrokenError looks for the "torn tail" prefix to suggest bgl repair.
+        return fail(
+            len(lines) + 1,
+            f"torn tail: {len(torn_tail)} bytes after the last complete line",
+        )
+    return ChainReport(writer.code, tuple(good), prev, None)
 
 
 def verify_all_chains(root: Path, project: Project) -> LedgerReport:
@@ -186,6 +285,8 @@ def verify_all_chains(root: Path, project: Project) -> LedgerReport:
             code: verify_chain(*read_chain(chain_path(root, project, code)), writer)
             for code, writer in project.writers.items()
         }
+        # [DECISION] Only *.jsonl directly in the ledger folder count. Names are
+        # compared exactly, so cg1.jsonl is unregistered when the code is CG1.
         unregistered = tuple(
             path.name
             for path in chain_files(root, project)
@@ -201,8 +302,24 @@ def append_row(
     private_key: Ed25519PrivateKey,
     fields: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """R7, R18: verify the writer's chain under the lock, then append. By hand."""
-    raise NotImplementedError("append_row is not written yet")
+    """The only way a row enters the ledger (R7, R18).
+
+    Verifies the writer's chain under the ledger lock, then builds the row on the
+    verified head and appends it. Raises ChainBrokenError on any problem,
+    including a torn tail, without touching the file.
+    """
+    merged = _with_chain_code(fields, writer)
+    with ledger_lock(root):
+        path = chain_path(root, project, writer.code)
+        lines, tail = read_chain(path)
+        report = verify_chain(lines, tail, writer)
+        if report.problem is not None:
+            raise ChainBrokenError(
+                writer.code, report.problem.line, report.problem.reason
+            )
+        row = build_row(merged, report.head, private_key)
+        append_line(path, line_bytes(row))
+    return row
 
 
 def repair_chain(
@@ -212,5 +329,50 @@ def repair_chain(
     private_key: Ed25519PrivateKey,
     fields: Mapping[str, Any],
 ) -> dict[str, Any]:
-    """R14: remove a torn tail and record it in a repair row. By hand."""
-    raise NotImplementedError("repair_chain is not written yet")
+    """Remove a torn tail and record it in a repair row (R14).
+
+    Only a torn tail is ever removed. A broken complete line refuses the repair,
+    so repair can never hide a broken row.
+    """
+    if "event" in fields or "removed" in fields:
+        raise ValueError("repair_chain sets event and removed itself")
+    merged = _with_chain_code(fields, writer)
+    with ledger_lock(root):
+        path = chain_path(root, project, writer.code)
+        lines, tail = read_chain(path)
+        report = verify_chain(lines, None, writer)  # complete lines only
+        if report.problem is not None:
+            raise ChainBrokenError(
+                writer.code, report.problem.line, report.problem.reason
+            )
+        if tail is None:
+            raise NothingToRepairError(writer.code)
+        # Hash the bytes before they are gone.
+        merged["event"] = "repair"
+        merged["removed"] = {
+            "length": len(tail),
+            "sha256": hashlib.sha256(tail).hexdigest(),
+        }
+        # [DECISION] A crash between truncating and appending leaves a clean
+        # chain with no repair row. Accepted: the removed bytes were never a
+        # complete signed row, so no evidence is lost.
+        truncate_tail(path, len(tail))
+        row = build_row(merged, report.head, private_key)
+        append_line(path, line_bytes(row))
+    return row
+
+
+def _with_chain_code(fields: Mapping[str, Any], writer: Writer) -> dict[str, Any]:
+    """A copy of fields with chain set to the writer's code.
+
+    [DECISION] Checked before the lock is taken or any file changes. A caller may
+    leave chain out; a different code is refused, so no caller can write into
+    another writer's chain.
+    """
+    merged = dict(fields)
+    chain = merged.setdefault("chain", writer.code)
+    if chain != writer.code:
+        raise ValueError(
+            f"fields name chain {chain!r}, but the writer is {writer.code}"
+        )
+    return merged
