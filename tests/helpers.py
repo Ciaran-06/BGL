@@ -2,6 +2,10 @@
 
 from pathlib import Path
 
+import pytest
+
+from bgl.config import ConfigError, ConfigErrorGroup, load_config
+
 MINIMAL_VALID = """
 [project]
 name = "example_project"
@@ -67,3 +71,42 @@ def replace(fixture_text: str, old_text: str, new_text: str) -> str:
     if count != 1:
         raise ValueError(f"expected {old_text!r} exactly once, found {count} times")
     return fixture_text.replace(old_text, new_text)
+
+
+def load_error(tmp_path: Path, text: str) -> ConfigError | ConfigErrorGroup:
+    """Write text as bgl.toml, load it, and return the error it must raise."""
+    with pytest.raises((ConfigError, ConfigErrorGroup)) as info:
+        load_config(write(tmp_path, text))
+    error = info.value
+    assert isinstance(error, (ConfigError, ConfigErrorGroup))
+    return error
+
+
+def _flatten(error: BaseException) -> list[ConfigError]:
+    if isinstance(error, ConfigErrorGroup):
+        return list(error.exceptions)
+    if isinstance(error, ConfigError):
+        return [error]
+    raise TypeError(
+        f"expected ConfigError or ConfigErrorGroup, got {type(error).__name__}"
+    )
+
+
+def assert_has_error(error: BaseException, rule: str, key: str | None = None) -> None:
+    """Fail unless the error, or one inside the group, has this rule (and key)."""
+    __tracebackhide__ = True
+    found = _flatten(error)
+    if any(e.rule == rule and (key is None or e.key == key) for e in found):
+        return
+    wanted = f"{rule} at {key}" if key is not None else rule
+    pairs = ", ".join(f"{e.rule} at {e.key}" for e in found)
+    raise AssertionError(f"no {wanted} error; found: {pairs}")
+
+
+def assert_no_error(error: BaseException, rule: str) -> None:
+    """Fail if the error, or any inside the group, has this rule."""
+    __tracebackhide__ = True
+    found = [e for e in _flatten(error) if e.rule == rule]
+    if found:
+        keys = ", ".join(str(e.key) for e in found)
+        raise AssertionError(f"unexpected {rule} error at: {keys}")

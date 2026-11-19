@@ -1,7 +1,25 @@
 from pathlib import Path
 
 import pytest
-from helpers import replace, write, write_bytes
+from helpers import (
+    assert_has_error,
+    assert_no_error,
+    replace,
+    write,
+    write_bytes,
+)
+
+from bgl.config import ConfigError, ConfigErrorGroup
+
+FILE = Path("bgl.toml")
+
+
+def error(rule: str, key: str | None = None) -> ConfigError:
+    return ConfigError(FILE, rule, "something", key=key, found=1)
+
+
+def group(*errors: ConfigError) -> ConfigErrorGroup:
+    return ConfigErrorGroup(FILE, errors)
 
 
 class TestWrite:
@@ -47,3 +65,43 @@ class TestReplace:
     def test_substring_match_is_replaced(self) -> None:
         # Documents the trap: include the whole value in the old text.
         assert replace("budget = 20\n", "budget = 2", "budget = 5") == "budget = 50\n"
+
+
+class TestAssertHasError:
+    def test_passes_on_matching_rule_in_group(self) -> None:
+        assert_has_error(group(error("C4"), error("C3")), "C3")
+
+    def test_passes_on_matching_rule_and_key(self) -> None:
+        found = group(error("C3", "studies.alpha.budget"))
+        assert_has_error(found, "C3", "studies.alpha.budget")
+
+    def test_passes_on_single_config_error(self) -> None:
+        assert_has_error(error("C8"), "C8")
+
+    def test_fails_on_wrong_key(self) -> None:
+        found = group(error("C3", "studies.alpha.budget"))
+        with pytest.raises(AssertionError):
+            assert_has_error(found, "C3", "studies.beta.budget")
+
+    def test_fails_on_missing_rule(self) -> None:
+        with pytest.raises(AssertionError):
+            assert_has_error(group(error("C3")), "C7")
+
+    def test_failure_lists_errors_found(self) -> None:
+        found = group(error("C3", "studies.alpha.budget"), error("C4", "x.prefix"))
+        with pytest.raises(AssertionError, match="C3 at studies.alpha.budget") as info:
+            assert_has_error(found, "C7")
+        assert "C4 at x.prefix" in str(info.value)
+
+    def test_rejects_other_exception_types(self) -> None:
+        with pytest.raises(TypeError):
+            assert_has_error(ValueError("x"), "C3")
+
+
+class TestAssertNoError:
+    def test_passes_when_rule_absent(self) -> None:
+        assert_no_error(group(error("C4")), "C6")
+
+    def test_fails_when_rule_present(self) -> None:
+        with pytest.raises(AssertionError, match="C6"):
+            assert_no_error(group(error("C6", "studies.beta.prefix")), "C6")
