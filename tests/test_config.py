@@ -46,13 +46,13 @@ class TestReadToml:
     def test_c9_invalid_utf8(self, tmp_path: Path) -> None:
         path = write_bytes(tmp_path, b'x="\xff"\n')
         with pytest.raises(ConfigError) as info:
-            dict = read_toml(path)
+            read_toml(path)
         assert info.value.rule == "C9"
 
     def test_c9_byte_order_mark(self, tmp_path: Path) -> None:
         path = write_bytes(tmp_path, b"\xef\xbb\xbfx = 20\n")
         with pytest.raises(ConfigError) as info:
-            dict = read_toml(path)
+            read_toml(path)
         assert info.value.rule == "C9"
 
     def test_c9_line_number_appears_once(self, tmp_path: Path) -> None:
