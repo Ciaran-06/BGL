@@ -9,6 +9,11 @@ from typing import Any
 _MAX_FOUND_LENGTH = 80
 _LINE_IN_MESSAGE = re.compile(r"at line (\d+)")
 
+_POSITION_IN_MESSAGE = re.compile(
+    r"\s*\(at (?:line \d+, column \d+|end of document)\)\s*$"
+)
+_UTF8_BOM = b"\xef\xbb\xbf"
+
 
 class ConfigError(Exception):
     """A bgl.toml problem. Every config failure raises this one type."""
@@ -57,24 +62,45 @@ def read_toml(file: Path) -> dict[str, Any]:
         raise TypeError(f"read_toml expects a pathlib.Path, got {type(file).__name__}")
     if file.is_dir():
         raise ConfigError(file, "C8", "a file, but this path is a folder")
-    try:
-        with file.open("rb") as handle:
-            return tomllib.load(handle)
 
+    try:
+        raw = file.read_bytes()
     except FileNotFoundError as error:
         raise ConfigError(
             file, "C8", "a bgl.toml file (run bgl init to create one)"
         ) from error
-    except tomllib.TOMLDecodeError as error:
-        raise ConfigError(
-            file, "C9", f"valid TOML ({error})", line=_error_line(error)
-        ) from error
-    except UnicodeDecodeError as error:
-        raise ConfigError(file, "C9", "a UTF-8 text file") from error
     except OSError as error:
         raise ConfigError(
             file, "C8", f"a readable file ({error.strerror or error})"
         ) from error
+
+    if raw.startswith(_UTF8_BOM):
+        raise ConfigError(
+            file, "C9", "UTF-8 without a byte-order mark (save the file without a BOM)"
+        )
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ConfigError(file, "C9", "a UTF-8 text file") from error
+
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        raise ConfigError(
+            file,
+            "C9",
+            f"valid TOML ({_error_text(error)})",
+            line=_error_line(error),
+        ) from error
+
+
+def _error_text(error: tomllib.TOMLDecodeError) -> str:
+    """A TOML syntax error's message without its position, which ConfigError shows."""
+    msg = getattr(error, "msg", None)
+    if isinstance(msg, str):
+        return msg
+    return _POSITION_IN_MESSAGE.sub("", str(error))
 
 
 def _error_line(error: tomllib.TOMLDecodeError) -> int | None:
