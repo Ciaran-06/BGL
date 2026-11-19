@@ -1,4 +1,6 @@
 import base64
+import datetime
+import json
 import math
 import os
 import sys
@@ -8,6 +10,7 @@ from typing import Any
 
 import pytest
 from helpers import (
+    FULL_VALID,
     MINIMAL_VALID,
     SECOND_STUDY,
     assert_has_error,
@@ -19,10 +22,14 @@ from helpers import (
 )
 
 from bgl.config import (
+    Config,
     ConfigError,
     ConfigErrorGroup,
     ErrorCollector,
     Mode,
+    canonical_number,
+    canonical_registry,
+    canonical_study,
     check_https_url,
     check_https_url_list,
     check_mode,
@@ -41,11 +48,6 @@ from bgl.config import (
     key_path,
     load_config,
     read_toml,
-)
-
-PHASE_2_NOT_WRITTEN = (
-    "phase 2 validators not written yet; "
-    "switch these to rule and key assertions when they are"
 )
 
 
@@ -212,7 +214,6 @@ class TestErrorCollector:
         assert "found missing" in str(collector.errors[0])
 
 
-@pytest.mark.skip(reason=PHASE_2_NOT_WRITTEN)
 class TestLoadConfig:
     def test_minimal_valid_loads(self, tmp_path: Path) -> None:
         config = load_config(write(tmp_path, MINIMAL_VALID))
@@ -220,7 +221,6 @@ class TestLoadConfig:
         assert config.studies["alpha"].budget == 20
 
 
-@pytest.mark.skip(reason=PHASE_2_NOT_WRITTEN)
 class TestC1ProjectTable:
     @pytest.mark.parametrize(
         "name",
@@ -247,7 +247,6 @@ class TestC1ProjectTable:
         load_config(write(tmp_path, text))
 
 
-@pytest.mark.skip(reason=PHASE_2_NOT_WRITTEN)
 class TestC2Paths:
     @pytest.mark.parametrize(
         "ledger",
@@ -264,7 +263,6 @@ class TestC2Paths:
         assert_has_error(load_error(tmp_path, bad), "C2", "project.ledger")
 
 
-@pytest.mark.skip(reason=PHASE_2_NOT_WRITTEN)
 class TestC3Budget:
     @pytest.mark.parametrize(
         "value",
@@ -285,7 +283,6 @@ class TestC3Budget:
         )
 
 
-@pytest.mark.skip(reason=PHASE_2_NOT_WRITTEN)
 class TestC4Prefix:
     @pytest.mark.parametrize(
         "value",
@@ -311,27 +308,36 @@ class TestC4Prefix:
         load_config(write(tmp_path, good))
 
 
-@pytest.mark.skip(reason=PHASE_2_NOT_WRITTEN)
 class TestC5Claims:
     @pytest.mark.parametrize(
-        "value",
+        ("value", "key"),
         [
-            pytest.param('["effect_exists", "effect_exists"]', id="duplicate"),
-            pytest.param('[""]', id="empty_string"),
-            pytest.param('"effect_exists"', id="not_a_list"),
-            pytest.param("[1]", id="not_strings"),
+            pytest.param(
+                '["effect_exists", "effect_exists"]',
+                "studies.alpha.claims[1]",
+                id="duplicate",
+            ),
+            pytest.param('[""]', "studies.alpha.claims[0]", id="empty_string"),
+            pytest.param('"effect_exists"', "studies.alpha.claims", id="not_a_list"),
+            pytest.param("[1]", "studies.alpha.claims[0]", id="not_strings"),
+            pytest.param('["Effect"]', "studies.alpha.claims[0]", id="upper_case"),
+            pytest.param(
+                '["a" ]'.replace('"a"', '"' + "a" * 33 + '"'),
+                "studies.alpha.claims[0]",
+                id="33_chars",
+            ),
+            pytest.param('["2x"]', "studies.alpha.claims[0]", id="starts_with_digit"),
         ],
     )
-    def test_bad_claims(self, tmp_path: Path, value: str) -> None:
+    def test_bad_claims(self, tmp_path: Path, value: str, key: str) -> None:
         bad = replace(MINIMAL_VALID, 'claims = ["effect_exists"]', f"claims = {value}")
-        assert_has_error(load_error(tmp_path, bad), "C5", "studies.alpha.claims")
+        assert_has_error(load_error(tmp_path, bad), "C5", key)
 
     def test_empty_list_is_valid(self, tmp_path: Path) -> None:
         good = replace(MINIMAL_VALID, 'claims = ["effect_exists"]', "claims = []")
         load_config(write(tmp_path, good))
 
 
-@pytest.mark.skip(reason=PHASE_2_NOT_WRITTEN)
 class TestC6UniquePrefixes:
     def test_shared_prefix(self, tmp_path: Path) -> None:
         bad = replace(MINIMAL_VALID + SECOND_STUDY, 'prefix = "BE"', 'prefix = "AL"')
@@ -349,7 +355,6 @@ class TestC6UniquePrefixes:
         assert_no_error(found, "C6")
 
 
-@pytest.mark.skip(reason=PHASE_2_NOT_WRITTEN)
 class TestC7UnknownKeys:
     def test_misspelt_key(self, tmp_path: Path) -> None:
         bad = replace(MINIMAL_VALID, "budget = 20", "budgt = 20")
@@ -363,7 +368,6 @@ class TestC7UnknownKeys:
 
 
 class TestGroupBehaviour:
-    @pytest.mark.skip(reason=PHASE_2_NOT_WRITTEN)
     def test_two_mistakes_in_different_tables_are_both_reported(
         self, tmp_path: Path
     ) -> None:
@@ -592,17 +596,21 @@ class TestCheckString:
 
 class TestCheckPath:
     @pytest.mark.parametrize(
-        "value",
+        ("value", "tidied"),
         [
-            pytest.param("bgl/ledger", id="simple"),
-            pytest.param("bgl/./ledger", id="dot_segment"),
-            pytest.param("a/b/../c", id="dotdot_stays_inside"),
-            pytest.param("data/raw/prices.parquet", id="file"),
+            pytest.param("bgl/ledger", "bgl/ledger", id="simple"),
+            pytest.param("bgl/./ledger", "bgl/ledger", id="dot_segment"),
+            pytest.param("a/b/../c", "a/c", id="dotdot_stays_inside"),
+            pytest.param("bgl//ledger/", "bgl/ledger", id="double_and_trailing_slash"),
+            pytest.param("./bgl", "bgl", id="leading_dot"),
+            pytest.param(
+                "data/raw/prices.parquet", "data/raw/prices.parquet", id="file"
+            ),
         ],
     )
-    def test_valid(self, value: str) -> None:
+    def test_valid_returns_tidied_path(self, value: str, tidied: str) -> None:
         found = new_collector()
-        assert check_path(found, {"ledger": value}, "ledger", "project") == value
+        assert check_path(found, {"ledger": value}, "ledger", "project") == tidied
         assert not found.has_errors()
 
     @pytest.mark.parametrize(
@@ -649,6 +657,23 @@ class TestCheckPathList:
         result, found = self.check(["a/x.parquet", "b/y.parquet"], allow_empty=False)
         assert result == ("a/x.parquet", "b/y.parquet")
         assert not found.has_errors()
+
+    def test_items_are_tidied(self) -> None:
+        result, found = self.check(["a/./x.parquet", "b//y.parquet"], allow_empty=False)
+        assert result == ("a/x.parquet", "b/y.parquet")
+        assert not found.has_errors()
+
+    @pytest.mark.parametrize(
+        "second",
+        [
+            pytest.param("a/x.parquet", id="exact"),
+            pytest.param("a/./x.parquet", id="after_tidying"),
+        ],
+    )
+    def test_repeat_is_owning_rule_at_later_index(self, second: str) -> None:
+        result, found = self.check(["a/x.parquet", second], allow_empty=False)
+        assert result is None
+        assert only_error(found) == ("C11", "studies.alpha.holdout_files[1]", second)
 
     def test_empty_allowed(self) -> None:
         result, found = self.check([], allow_empty=True)
@@ -1186,3 +1211,686 @@ class TestCheckHttpsUrlList:
             ("C17", f"{self.PATH}.ots_calendars[1]"),
             ("C20", f"{self.PATH}.ots_calendars[2]"),
         ]
+
+
+# --- Studies, gate, loading and canonical tables (sprint) ---
+
+
+def load(tmp_path: Path, text: str) -> Config:
+    return load_config(write(tmp_path, text))
+
+
+def found_pairs(error: ConfigError | ConfigErrorGroup) -> list[tuple[str, str | None]]:
+    errors = list(error.exceptions) if isinstance(error, ConfigErrorGroup) else [error]
+    return [(e.rule, e.key) for e in errors]
+
+
+def without_line(text: str, line: str) -> str:
+    return replace(text, line + "\n", "")
+
+
+SOLO_HOLDOUT = replace(
+    MINIMAL_VALID,
+    "holdout = false\n",
+    'holdout_start = 2025-01-01\nholdout_files = ["data/h.parquet"]\n'
+    "restricted_files = []\n",
+)
+
+
+class TestLoadConfigRecords:
+    def test_full_valid_loads_every_part(self, tmp_path: Path) -> None:
+        config = load(tmp_path, FULL_VALID)
+        assert config.project.mode == "team"
+        assert set(config.project.writers) == {"CG1", "CG2", "HC1"}
+        study = config.studies["alpha"]
+        assert study.name == "alpha"
+        assert study.claims == ("effect_exists", "effect_persists")
+        assert study.holdout is not None
+        assert study.holdout.start == datetime.date(2025, 1, 1)
+        assert study.holdout.custodian == "custodian_a"
+        assert study.returns.risk_free == "data/rates/rf_daily.csv"
+        assert study.returns.risk_free_reasoning is None
+        assert study.gate is not None
+        assert study.gate.cscv_blocks == 16
+        assert study.gate.costs.cost_bps == 5.0
+        assert isinstance(study.gate.costs.cost_bps, float)
+        assert study.gate.basis["costs"].kind == "reasoning"
+        assert set(study.gate.basis) == {
+            "dsr_threshold",
+            "psr_threshold",
+            "pbo_threshold",
+            "pbo_min_trials",
+            "cscv_blocks",
+            "min_block_periods",
+            "min_live_days",
+            "live_witness_lag_days",
+            "costs",
+        }
+
+    def test_minimal_study_has_no_holdout_or_gate(self, tmp_path: Path) -> None:
+        study = load(tmp_path, MINIMAL_VALID).studies["alpha"]
+        assert study.holdout is None
+        assert study.gate is None
+        assert study.returns.risk_free is None
+        assert study.returns.risk_free_reasoning == "Self-financing long-short book"
+
+    def test_studies_are_read_only(self, tmp_path: Path) -> None:
+        config = load(tmp_path, MINIMAL_VALID + SECOND_STUDY)
+        assert set(config.studies) == {"alpha", "beta"}
+        with pytest.raises(TypeError):
+            config.studies["gamma"] = config.studies["alpha"]  # type: ignore[index]
+
+    def test_phase_1_error_is_a_single_config_error(self, tmp_path: Path) -> None:
+        with pytest.raises(ConfigError) as info:
+            load_config(tmp_path / "bgl.toml")
+        assert info.value.rule == "C8"
+
+    def test_paths_are_stored_tidied(self, tmp_path: Path) -> None:
+        text = replace(
+            FULL_VALID, '"docs/studies/alpha.md"', '"docs/./studies//alpha.md"'
+        )
+        assert load(tmp_path, text).studies["alpha"].spec_files == (
+            "docs/studies/alpha.md",
+        )
+
+
+class TestC1StudyNames:
+    @pytest.mark.parametrize(
+        "name",
+        [
+            pytest.param("a", id="one_char"),
+            pytest.param("a" * 32, id="32_chars"),
+            pytest.param("alpha_2", id="underscore_digit"),
+        ],
+    )
+    def test_valid(self, tmp_path: Path, name: str) -> None:
+        text = replace(MINIMAL_VALID, "[studies.alpha]", f"[studies.{name}]")
+        text = replace(text, "[studies.alpha.returns]", f"[studies.{name}.returns]")
+        assert set(load(tmp_path, text).studies) == {name}
+
+    @pytest.mark.parametrize(
+        ("header", "key"),
+        [
+            pytest.param("Alpha", "studies.Alpha", id="capital"),
+            pytest.param("1alpha", "studies.1alpha", id="starts_with_digit"),
+            pytest.param("al-pha", "studies.al-pha", id="hyphen"),
+            pytest.param('"my.study"', "studies.my.study", id="dot"),
+            pytest.param("a" * 33, "studies." + "a" * 33, id="33_chars"),
+        ],
+    )
+    def test_invalid_is_c1(self, tmp_path: Path, header: str, key: str) -> None:
+        text = replace(MINIMAL_VALID, "[studies.alpha]", f"[studies.{header}]")
+        text = replace(text, "[studies.alpha.returns]", f"[studies.{header}.returns]")
+        assert_has_error(load_error(tmp_path, text), "C1", key)
+
+    def test_study_that_is_not_a_table(self, tmp_path: Path) -> None:
+        text = MINIMAL_VALID.split("[studies.alpha]")[0] + "[studies]\nalpha = 3\n"
+        assert found_pairs(load_error(tmp_path, text)) == [("C1", "studies.alpha")]
+
+
+class TestC2StudyPaths:
+    @pytest.mark.parametrize(
+        ("old", "new", "key"),
+        [
+            pytest.param(
+                '"data/rates/rf_daily.csv"',
+                '"/rates.csv"',
+                "studies.alpha.returns.risk_free",
+                id="risk_free",
+            ),
+            pytest.param(
+                '"docs/studies/alpha.md"',
+                '"../alpha.md"',
+                "studies.alpha.spec_files[0]",
+                id="spec_file",
+            ),
+            pytest.param(
+                '"data/holdout/alpha_holdout.parquet"',
+                '"C:/h.parquet"',
+                "studies.alpha.holdout_files[0]",
+                id="holdout_file",
+            ),
+        ],
+    )
+    def test_bad_path_is_c2(self, tmp_path: Path, old: str, new: str, key: str) -> None:
+        assert found_pairs(load_error(tmp_path, replace(FULL_VALID, old, new))) == [
+            ("C2", key)
+        ]
+
+
+GATE = "studies.alpha.gate"
+
+
+class TestC10Gate:
+    @pytest.mark.parametrize(
+        ("line", "value", "ok"),
+        [
+            pytest.param("dsr_threshold = 0.95", "0", False, id="dsr_0"),
+            pytest.param("dsr_threshold = 0.95", "1", False, id="dsr_1"),
+            pytest.param("dsr_threshold = 0.95", "0.999", True, id="dsr_0_999"),
+            pytest.param("dsr_threshold = 0.95", "nan", False, id="dsr_nan"),
+            pytest.param("psr_threshold = 0.95", "1.0", False, id="psr_1"),
+            pytest.param("psr_threshold = 0.95", "0.001", True, id="psr_small"),
+            pytest.param("pbo_threshold = 0.05", "0.5", True, id="pbo_0_5"),
+            pytest.param("pbo_threshold = 0.05", "0.5000001", False, id="pbo_over"),
+            pytest.param("pbo_threshold = 0.05", "0", False, id="pbo_0"),
+            pytest.param("pbo_threshold = 0.05", "inf", False, id="pbo_inf"),
+            pytest.param("pbo_min_trials = 10", "2", True, id="trials_2"),
+            pytest.param("pbo_min_trials = 10", "1", False, id="trials_1"),
+            pytest.param("cscv_blocks = 16", "4", True, id="blocks_4"),
+            pytest.param("cscv_blocks = 16", "2", False, id="blocks_2"),
+            pytest.param("cscv_blocks = 16", "5", False, id="blocks_odd"),
+            pytest.param("cscv_blocks = 16", "16.0", False, id="blocks_float"),
+            pytest.param("min_block_periods = 20", "1", True, id="block_periods_1"),
+            pytest.param("min_block_periods = 20", "0", False, id="block_periods_0"),
+            pytest.param("min_live_days = 90", "0", False, id="live_days_0"),
+            pytest.param("live_witness_lag_days = 3", "1", True, id="lag_1"),
+            pytest.param("live_witness_lag_days = 3", "0", False, id="lag_0"),
+            pytest.param("live_witness_lag_days = 3", "true", False, id="lag_bool"),
+        ],
+    )
+    def test_ranges(self, tmp_path: Path, line: str, value: str, ok: bool) -> None:
+        key = line.split(" = ")[0]
+        text = replace(FULL_VALID, line + "\n", f"{key} = {value}\n")
+        if ok:
+            load(tmp_path, text)
+        else:
+            assert found_pairs(load_error(tmp_path, text)) == [("C10", f"{GATE}.{key}")]
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "dsr_threshold = 0.95",
+            "psr_threshold = 0.95",
+            "pbo_threshold = 0.05",
+            "pbo_min_trials = 10",
+            "cscv_blocks = 16",
+            "min_block_periods = 20",
+            "min_live_days = 90",
+            "live_witness_lag_days = 3",
+        ],
+    )
+    def test_every_value_is_required(self, tmp_path: Path, line: str) -> None:
+        key = line.split(" = ")[0]
+        text = without_line(FULL_VALID, line)
+        assert found_pairs(load_error(tmp_path, text)) == [("C10", f"{GATE}.{key}")]
+
+    def test_gate_is_optional(self, tmp_path: Path) -> None:
+        assert load(tmp_path, MINIMAL_VALID).studies["alpha"].gate is None
+
+    def test_gate_not_a_table(self, tmp_path: Path) -> None:
+        text = replace(
+            MINIMAL_VALID, "spec_files = []\n", "spec_files = []\ngate = 1\n"
+        )
+        assert found_pairs(load_error(tmp_path, text)) == [("C10", GATE)]
+
+    def test_unknown_gate_key_is_c7(self, tmp_path: Path) -> None:
+        text = replace(
+            FULL_VALID, "cscv_blocks = 16\n", "cscv_blocks = 16\nmintrl = 1\n"
+        )
+        assert found_pairs(load_error(tmp_path, text)) == [("C7", f"{GATE}.mintrl")]
+
+    def test_missing_costs_and_basis(self, tmp_path: Path) -> None:
+        text = FULL_VALID.split("[studies.alpha.gate.costs]")[0]
+        assert found_pairs(load_error(tmp_path, text)) == [
+            ("C10", f"{GATE}.costs"),
+            ("C10", f"{GATE}.basis"),
+        ]
+
+    @pytest.mark.parametrize(
+        ("old", "new", "pair"),
+        [
+            pytest.param(
+                'model = "flat"',
+                'model = "linear"',
+                ("C10", f"{GATE}.costs.model"),
+                id="model",
+            ),
+            pytest.param(
+                "cost_bps = 5",
+                "cost_bps = -0.5",
+                ("C10", f"{GATE}.costs.cost_bps"),
+                id="negative_cost",
+            ),
+            pytest.param(
+                "cost_bps = 5",
+                "cost_bps = 5\nslippage = 1",
+                ("C7", f"{GATE}.costs.slippage"),
+                id="unknown_cost_key",
+            ),
+        ],
+    )
+    def test_bad_costs(
+        self, tmp_path: Path, old: str, new: str, pair: tuple[str, str]
+    ) -> None:
+        assert found_pairs(load_error(tmp_path, replace(FULL_VALID, old, new))) == [
+            pair
+        ]
+
+    def test_zero_cost_is_valid(self, tmp_path: Path) -> None:
+        config = load(tmp_path, replace(FULL_VALID, "cost_bps = 5", "cost_bps = 0"))
+        gate = config.studies["alpha"].gate
+        assert gate is not None
+        assert gate.costs.cost_bps == 0.0
+
+    def test_missing_basis_entry(self, tmp_path: Path) -> None:
+        text = without_line(
+            FULL_VALID,
+            'costs = { kind = "reasoning", text = "Typical all-in cost for liquid '
+            'large caps" }',
+        )
+        assert found_pairs(load_error(tmp_path, text)) == [
+            ("C10", f"{GATE}.basis.costs")
+        ]
+
+    @pytest.mark.parametrize(
+        ("new", "pair"),
+        [
+            pytest.param(
+                '{ kind = "opinion", text = "x" }',
+                ("C10", f"{GATE}.basis.cscv_blocks.kind"),
+                id="bad_kind",
+            ),
+            pytest.param(
+                '{ kind = "citation", text = "" }',
+                ("C10", f"{GATE}.basis.cscv_blocks.text"),
+                id="empty_text",
+            ),
+            pytest.param(
+                '{ kind = "citation", text = "TODO(bgl): cite a source" }',
+                ("C20", f"{GATE}.basis.cscv_blocks.text"),
+                id="placeholder",
+            ),
+            pytest.param(
+                '{ kind = "citation", text = "x", page = 3 }',
+                ("C7", f"{GATE}.basis.cscv_blocks.page"),
+                id="unknown_entry_key",
+            ),
+            pytest.param(
+                '"Bailey et al. (2017)"',
+                ("C10", f"{GATE}.basis.cscv_blocks"),
+                id="not_a_table",
+            ),
+        ],
+    )
+    def test_bad_basis_entry(
+        self, tmp_path: Path, new: str, pair: tuple[str, str]
+    ) -> None:
+        old = 'cscv_blocks = { kind = "citation", text = "Bailey et al. (2017)" }'
+        text = replace(FULL_VALID, old, f"cscv_blocks = {new}")
+        assert found_pairs(load_error(tmp_path, text)) == [pair]
+
+    def test_unknown_basis_key_is_c7(self, tmp_path: Path) -> None:
+        extra = 'capital = { kind = "reasoning", text = "x" }\n'
+        text = FULL_VALID + extra
+        assert found_pairs(load_error(tmp_path, text)) == [
+            ("C7", f"{GATE}.basis.capital")
+        ]
+
+
+ALPHA = "studies.alpha"
+
+
+class TestC11Holdout:
+    def test_both_start_and_flag(self, tmp_path: Path) -> None:
+        text = replace(
+            FULL_VALID,
+            "holdout_start = 2025-01-01\n",
+            "holdout_start = 2025-01-01\nholdout = false\n",
+        )
+        assert found_pairs(load_error(tmp_path, text)) == [("C11", f"{ALPHA}.holdout")]
+
+    def test_neither_start_nor_flag(self, tmp_path: Path) -> None:
+        text = without_line(MINIMAL_VALID, "holdout = false")
+        assert found_pairs(load_error(tmp_path, text)) == [
+            ("C11", f"{ALPHA}.holdout_start")
+        ]
+
+    def test_holdout_true(self, tmp_path: Path) -> None:
+        text = replace(MINIMAL_VALID, "holdout = false", "holdout = true")
+        assert found_pairs(load_error(tmp_path, text)) == [("C11", f"{ALPHA}.holdout")]
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param('"2025-01-01"', id="quoted"),
+            pytest.param("2025-01-01T00:00:00", id="datetime"),
+            pytest.param("2025-01-01 09:30:00Z", id="datetime_utc"),
+            pytest.param("09:30:00", id="time"),
+        ],
+    )
+    def test_start_must_be_a_plain_date(self, tmp_path: Path, value: str) -> None:
+        text = replace(
+            FULL_VALID, "holdout_start = 2025-01-01", f"holdout_start = {value}"
+        )
+        assert found_pairs(load_error(tmp_path, text)) == [
+            ("C11", f"{ALPHA}.holdout_start")
+        ]
+
+    @pytest.mark.parametrize(
+        ("old", "new", "key"),
+        [
+            pytest.param(
+                'holdout_files = ["data/holdout/alpha_holdout.parquet"]',
+                "holdout_files = []",
+                f"{ALPHA}.holdout_files",
+                id="empty_holdout_files",
+            ),
+            pytest.param(
+                'holdout_files = ["data/holdout/alpha_holdout.parquet"]\n',
+                "",
+                f"{ALPHA}.holdout_files",
+                id="missing_holdout_files",
+            ),
+            pytest.param(
+                'restricted_files = ["data/raw/prices.parquet"]\n',
+                "",
+                f"{ALPHA}.restricted_files",
+                id="missing_restricted_files",
+            ),
+            pytest.param(
+                'restricted_files = ["data/raw/prices.parquet"]',
+                'restricted_files = ["data/holdout/alpha_holdout.parquet"]',
+                f"{ALPHA}.restricted_files[0]",
+                id="overlap",
+            ),
+            pytest.param(
+                'restricted_files = ["data/raw/prices.parquet"]',
+                'restricted_files = ["data/holdout/./alpha_holdout.parquet"]',
+                f"{ALPHA}.restricted_files[0]",
+                id="overlap_after_tidying",
+            ),
+            pytest.param(
+                'holdout_files = ["data/holdout/alpha_holdout.parquet"]',
+                'holdout_files = ["data/h.parquet", "data/h.parquet"]',
+                f"{ALPHA}.holdout_files[1]",
+                id="repeat",
+            ),
+        ],
+    )
+    def test_bad_files(self, tmp_path: Path, old: str, new: str, key: str) -> None:
+        text = replace(FULL_VALID, old, new)
+        assert found_pairs(load_error(tmp_path, text)) == [("C11", key)]
+
+    def test_empty_restricted_files_is_valid(self, tmp_path: Path) -> None:
+        text = replace(
+            FULL_VALID,
+            'restricted_files = ["data/raw/prices.parquet"]',
+            "restricted_files = []",
+        )
+        holdout = load(tmp_path, text).studies["alpha"].holdout
+        assert holdout is not None
+        assert holdout.restricted_files == ()
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            'holdout_files = ["data/h.parquet"]',
+            "restricted_files = []",
+            'custodian = "researcher_a"',
+        ],
+    )
+    def test_no_holdout_refuses_holdout_keys(self, tmp_path: Path, line: str) -> None:
+        key = line.split(" = ")[0]
+        text = replace(MINIMAL_VALID, "holdout = false\n", f"holdout = false\n{line}\n")
+        assert found_pairs(load_error(tmp_path, text)) == [("C11", f"{ALPHA}.{key}")]
+
+
+class TestC13PriorTrials:
+    def test_missing(self, tmp_path: Path) -> None:
+        text = without_line(MINIMAL_VALID, "prior_trials = 0")
+        assert found_pairs(load_error(tmp_path, text)) == [
+            ("C13", f"{ALPHA}.prior_trials")
+        ]
+
+    def test_negative(self, tmp_path: Path) -> None:
+        text = replace(MINIMAL_VALID, "prior_trials = 0", "prior_trials = -1")
+        assert found_pairs(load_error(tmp_path, text)) == [
+            ("C13", f"{ALPHA}.prior_trials")
+        ]
+
+
+class TestC14C15Custodian:
+    def test_team_holdout_needs_custodian(self, tmp_path: Path) -> None:
+        text = without_line(FULL_VALID, 'custodian = "custodian_a"')
+        assert found_pairs(load_error(tmp_path, text)) == [
+            ("C14", f"{ALPHA}.custodian")
+        ]
+
+    def test_solo_holdout_may_omit_custodian(self, tmp_path: Path) -> None:
+        holdout = load(tmp_path, SOLO_HOLDOUT).studies["alpha"].holdout
+        assert holdout is not None
+        assert holdout.custodian is None
+
+    def test_bad_mode_hides_the_custodian_rule(self, tmp_path: Path) -> None:
+        text = replace(FULL_VALID, 'mode = "team"', 'mode = "both"')
+        text = without_line(text, 'custodian = "custodian_a"')
+        assert found_pairs(load_error(tmp_path, text)) == [("C14", "project.mode")]
+
+    def test_custodian_not_in_registry(self, tmp_path: Path) -> None:
+        text = replace(FULL_VALID, 'custodian = "custodian_a"', 'custodian = "nobody"')
+        assert found_pairs(load_error(tmp_path, text)) == [
+            ("C15", f"{ALPHA}.custodian")
+        ]
+
+    def test_empty_custodian(self, tmp_path: Path) -> None:
+        text = replace(FULL_VALID, 'custodian = "custodian_a"', 'custodian = ""')
+        assert found_pairs(load_error(tmp_path, text)) == [
+            ("C15", f"{ALPHA}.custodian")
+        ]
+
+    def test_invalid_registry_skips_c15(self, tmp_path: Path) -> None:
+        text = replace(FULL_VALID, 'person = "custodian_a"', 'person = ""')
+        found = load_error(tmp_path, text)
+        assert found_pairs(found) == [("C12", "project.chains.HC1.person")]
+
+    def test_solo_custodian_is_still_checked(self, tmp_path: Path) -> None:
+        text = replace(
+            SOLO_HOLDOUT,
+            "restricted_files = []\n",
+            'restricted_files = []\ncustodian = "nobody"\n',
+        )
+        assert found_pairs(load_error(tmp_path, text)) == [
+            ("C15", f"{ALPHA}.custodian")
+        ]
+
+
+RETURNS = "studies.alpha.returns"
+
+
+class TestC16Returns:
+    def test_missing_returns(self, tmp_path: Path) -> None:
+        text = MINIMAL_VALID.split("[studies.alpha.returns]")[0]
+        assert found_pairs(load_error(tmp_path, text)) == [("C16", RETURNS)]
+
+    @pytest.mark.parametrize(
+        ("old", "new", "pair"),
+        [
+            pytest.param(
+                "periods_per_year = 252",
+                "periods_per_year = 0",
+                ("C16", f"{RETURNS}.periods_per_year"),
+                id="periods_0",
+            ),
+            pytest.param(
+                "periods_per_year = 252",
+                "periods_per_year = 252.0",
+                ("C16", f"{RETURNS}.periods_per_year"),
+                id="periods_float",
+            ),
+            pytest.param(
+                'basis = "Daily close-to-close portfolio return"',
+                'basis = ""',
+                ("C16", f"{RETURNS}.basis"),
+                id="empty_basis",
+            ),
+            pytest.param(
+                'basis = "Daily close-to-close portfolio return"',
+                'basis = "TODO(bgl): describe the return"',
+                ("C20", f"{RETURNS}.basis"),
+                id="placeholder_basis",
+            ),
+            pytest.param(
+                'risk_free = "none"',
+                "risk_free = 0",
+                ("C16", f"{RETURNS}.risk_free"),
+                id="risk_free_number",
+            ),
+            pytest.param(
+                'risk_free = "none"',
+                'risk_free = ""',
+                ("C16", f"{RETURNS}.risk_free"),
+                id="risk_free_empty",
+            ),
+            pytest.param(
+                'risk_free_reasoning = "Self-financing long-short book"',
+                'risk_free_reasoning = "TODO(bgl): why no risk-free rate"',
+                ("C20", f"{RETURNS}.risk_free_reasoning"),
+                id="placeholder_reasoning",
+            ),
+            pytest.param(
+                'risk_free_reasoning = "Self-financing long-short book"',
+                'risk_free_reasoning = "x"\nleverage = 2',
+                ("C7", f"{RETURNS}.leverage"),
+                id="unknown_key",
+            ),
+        ],
+    )
+    def test_bad_returns(
+        self, tmp_path: Path, old: str, new: str, pair: tuple[str, str]
+    ) -> None:
+        text = replace(MINIMAL_VALID, old, new)
+        assert found_pairs(load_error(tmp_path, text)) == [pair]
+
+    def test_none_needs_reasoning(self, tmp_path: Path) -> None:
+        text = without_line(
+            MINIMAL_VALID, 'risk_free_reasoning = "Self-financing long-short book"'
+        )
+        assert found_pairs(load_error(tmp_path, text)) == [
+            ("C16", f"{RETURNS}.risk_free_reasoning")
+        ]
+
+    def test_path_refuses_reasoning(self, tmp_path: Path) -> None:
+        text = replace(MINIMAL_VALID, 'risk_free = "none"', 'risk_free = "data/rf.csv"')
+        assert found_pairs(load_error(tmp_path, text)) == [
+            ("C16", f"{RETURNS}.risk_free_reasoning")
+        ]
+
+    def test_missing_risk_free(self, tmp_path: Path) -> None:
+        text = without_line(MINIMAL_VALID, 'risk_free = "none"')
+        assert found_pairs(load_error(tmp_path, text)) == [
+            ("C16", f"{RETURNS}.risk_free")
+        ]
+
+
+class TestC17Loader:
+    def test_team_cannot_turn_witness_off(self, tmp_path: Path) -> None:
+        text = replace(MINIMAL_VALID, 'mode = "solo"', 'mode = "team"')
+        assert found_pairs(load_error(tmp_path, text)) == [("C17", "project.witness")]
+
+
+class TestC18SpecFiles:
+    @pytest.mark.parametrize(
+        ("new", "key"),
+        [
+            pytest.param("", f"{ALPHA}.spec_files", id="missing"),
+            pytest.param('spec_files = "a.md"\n', f"{ALPHA}.spec_files", id="string"),
+            pytest.param(
+                'spec_files = ["a.md", "./a.md"]\n',
+                f"{ALPHA}.spec_files[1]",
+                id="repeat",
+            ),
+        ],
+    )
+    def test_bad_spec_files(self, tmp_path: Path, new: str, key: str) -> None:
+        text = replace(MINIMAL_VALID, "spec_files = []\n", new)
+        assert found_pairs(load_error(tmp_path, text)) == [("C18", key)]
+
+
+class TestC6Keys:
+    def test_shared_prefix_reported_at_later_study(self, tmp_path: Path) -> None:
+        text = replace(MINIMAL_VALID + SECOND_STUDY, 'prefix = "BE"', 'prefix = "AL"')
+        assert found_pairs(load_error(tmp_path, text)) == [
+            ("C6", "studies.beta.prefix")
+        ]
+
+
+def _floats_in(value: Any) -> list[Any]:
+    if isinstance(value, float):
+        return [value]
+    if isinstance(value, dict):
+        return [f for item in value.values() for f in _floats_in(item)]
+    if isinstance(value, list):
+        return [f for item in value for f in _floats_in(item)]
+    return []
+
+
+class TestC19Canonical:
+    def test_full_study_has_no_floats(self, tmp_path: Path) -> None:
+        table = canonical_study(load(tmp_path, FULL_VALID).studies["alpha"])
+        assert _floats_in(table) == []
+        json.dumps(table)
+        assert table["holdout_start"] == "2025-01-01"
+        assert table["gate"]["dsr_threshold"] == "0.95"
+        assert table["gate"]["costs"]["cost_bps"] == "5.0"
+        assert table["gate"]["cscv_blocks"] == 16
+        assert table["custodian"] == "custodian_a"
+
+    def test_minimal_study(self, tmp_path: Path) -> None:
+        table = canonical_study(load(tmp_path, MINIMAL_VALID).studies["alpha"])
+        assert table["holdout"] is False
+        assert "gate" not in table
+        assert "holdout_start" not in table
+        assert table["returns"]["risk_free"] == "none"
+        assert (
+            table["returns"]["risk_free_reasoning"] == "Self-financing long-short book"
+        )
+
+    @pytest.mark.parametrize(
+        ("old", "new"),
+        [
+            pytest.param("cost_bps = 5", "cost_bps = 5.0", id="int_vs_float"),
+            pytest.param("cost_bps = 5", "cost_bps = 5.00", id="trailing_zero"),
+            pytest.param("dsr_threshold = 0.95", "dsr_threshold = 0.950", id="dsr"),
+            pytest.param(
+                '"docs/studies/alpha.md"', '"docs/./studies/alpha.md"', id="untidy_path"
+            ),
+        ],
+    )
+    def test_harmless_reformat_gives_same_table(
+        self, tmp_path: Path, old: str, new: str
+    ) -> None:
+        first = canonical_study(load(tmp_path, FULL_VALID).studies["alpha"])
+        second = canonical_study(
+            load(tmp_path, replace(FULL_VALID, old, new)).studies["alpha"]
+        )
+        assert first == second
+
+    def test_real_change_gives_different_table(self, tmp_path: Path) -> None:
+        first = canonical_study(load(tmp_path, FULL_VALID).studies["alpha"])
+        second = canonical_study(
+            load(tmp_path, replace(FULL_VALID, "cost_bps = 5", "cost_bps = 6")).studies[
+                "alpha"
+            ]
+        )
+        assert first != second
+
+    def test_registry_matches_file_text(self, tmp_path: Path) -> None:
+        registry = canonical_registry(load(tmp_path, FULL_VALID).project.writers)
+        assert registry["HC1"] == {
+            "person": "custodian_a",
+            "key": "ed25519:AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM=",
+        }
+
+    @pytest.mark.parametrize(
+        ("value", "text"),
+        [
+            pytest.param(0.95, "0.95", id="plain"),
+            pytest.param(5, "5.0", id="int"),
+            pytest.param(0.1 + 0.2, "0.30000000000000004", id="round_trip"),
+            pytest.param(1e-7, "1e-07", id="small"),
+        ],
+    )
+    def test_canonical_number(self, value: float, text: str) -> None:
+        assert canonical_number(value) == text
+        assert float(canonical_number(value)) == float(value)

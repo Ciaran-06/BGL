@@ -51,6 +51,74 @@ risk_free_reasoning = "Self-financing long-short book"
 """
 
 
+# A team project with a holdout, a custodian and a gate table: every optional
+# part present. Mirrors the example in the spec, with real keys.
+FULL_VALID = """
+[project]
+name = "example_project"
+mode = "team"
+ledger = "bgl/ledger"
+runs_dir = "bgl/runs"
+
+[project.chains.CG1]
+person = "researcher_a"
+key = "ed25519:AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+
+[project.chains.CG2]
+person = "researcher_a"
+key = "ed25519:AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
+
+[project.chains.HC1]
+person = "custodian_a"
+key = "ed25519:AwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwM="
+
+[project.witness]
+rekor_url = "https://rekor.example"
+ots_calendars = ["https://calendar-a.example", "https://calendar-b.example"]
+
+[studies.alpha]
+budget = 20
+prefix = "AL"
+claims = ["effect_exists", "effect_persists"]
+prior_trials = 0
+holdout_start = 2025-01-01
+holdout_files = ["data/holdout/alpha_holdout.parquet"]
+restricted_files = ["data/raw/prices.parquet"]
+custodian = "custodian_a"
+spec_files = ["docs/studies/alpha.md"]
+
+[studies.alpha.returns]
+periods_per_year = 252
+basis = "Daily close-to-close portfolio return on declared capital"
+risk_free = "data/rates/rf_daily.csv"
+
+[studies.alpha.gate]
+dsr_threshold = 0.95
+psr_threshold = 0.95
+pbo_threshold = 0.05
+pbo_min_trials = 10
+cscv_blocks = 16
+min_block_periods = 20
+min_live_days = 90
+live_witness_lag_days = 3
+
+[studies.alpha.gate.costs]
+model = "flat"
+cost_bps = 5
+
+[studies.alpha.gate.basis]
+dsr_threshold = { kind = "citation", text = "Bailey and Lopez de Prado (2014)" }
+psr_threshold = { kind = "reasoning", text = "Same confidence as the DSR bar" }
+pbo_threshold = { kind = "citation", text = "Bailey et al. (2017), PBO < 0.5" }
+pbo_min_trials = { kind = "reasoning", text = "Rank statistic too coarse below 10" }
+cscv_blocks = { kind = "citation", text = "Bailey et al. (2017)" }
+min_block_periods = { kind = "reasoning", text = "About one trading month per block" }
+min_live_days = { kind = "reasoning", text = "One quarter of live trading" }
+live_witness_lag_days = { kind = "reasoning", text = "Calendar days" }
+costs = { kind = "reasoning", text = "Typical all-in cost for liquid large caps" }
+"""
+
+
 def write(tmp_path: Path, text: str) -> Path:
     """Write text to bgl.toml in tmp_path as UTF-8 with LF line endings."""
     path = tmp_path / "bgl.toml"
