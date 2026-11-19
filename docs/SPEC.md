@@ -81,8 +81,14 @@ An independent review found 8 critical and 16 major problems. Most had one root:
 | --- | --- | --- |
 | N1 | Config decimals are floats, not `Decimal`. Integers are accepted for decimal keys and converted. The lock stores each float's shortest round-trip text as a string | Shared checks; C10; C19; Study lock |
 | N2 | C1 also requires a `[project]` table and a `[studies]` table, which may be empty. An empty file gives two C1 errors | C1 |
+| N3 | Every placeholder in BGL's templates and documentation contains the marker `TODO(bgl)`. C20 rejects any checked value containing it. Angle brackets are allowed, so basis text may contain inequalities such as `PBO < 0.5` | C20; File formats |
+| N4 | No public key appears twice in the registry. Study names are snake_case, 1 to 32 characters. `risk_free_reasoning` is an error when `risk_free` is a path. C20 covers every free-text value: gate basis texts, the returns `basis` and `risk_free_reasoning` | C1; C12; C16; C20 |
 
 *Reason for N1:* the statistics are floats, so keeping config numbers as floats avoids converting between types, and a harmless reformat (`0.95` to `0.950`) no longer looks like a change to a locked value.
+
+*Reason for N3:* the rule exists so that an unedited template does not load. BGL writes the templates, so it can mark them in a way that is easy to detect: a half-edited template is still caught, and ordinary reasoning text never is. The earlier wording also referred to a list of placeholder strings that the spec never gave.
+
+*Reason for N4:* discard detection lists Rekor entries by public key, so two chains sharing a key would each look as if heads were missing from the other, and a signature would no longer say which writer wrote a row. Study names appear in commands, rows and key paths, so they must need no shell quoting and contain no dots. A reasoning left behind after switching to a file would describe a choice the study no longer makes.
 
 ### Earlier revisions (18 Nov 2026; superseded where they conflict with the batch above)
 
@@ -522,15 +528,15 @@ runs_dir = "bgl/runs"
 
 [project.chains.CG1]
 person = "researcher_a"
-key = "ed25519:<public key printed by bgl join>"
+key = "ed25519:TODO(bgl): paste the public key printed by bgl join"
 
 [project.chains.CG2]
 person = "researcher_a"
-key = "ed25519:<public key printed by bgl join>"
+key = "ed25519:TODO(bgl): paste the public key printed by bgl join"
 
 [project.chains.HC1]
 person = "custodian_a"
-key = "ed25519:<public key printed by bgl join>"
+key = "ed25519:TODO(bgl): paste the public key printed by bgl join"
 
 [project.witness]
 rekor_url = "https://rekor.example"
@@ -722,7 +728,7 @@ At the end, the loader raises one `ConfigErrorGroup` (a subclass of `ExceptionGr
 
 **Rules**
 
-1. **C1. Project table.** A `[project]` table exists, and its `name` is a non-empty string. A `[studies]` table exists; it may be empty. *Reason:* no key has a default, so a missing table is an error, but a project may be set up before its first study. A run against no study is refused by R1.
+1. **C1. Project table.** A `[project]` table exists, and its `name` is a non-empty string. A `[studies]` table exists; it may be empty. Each study name (a key under `[studies]`) is a lowercase letter followed by lowercase letters, digits or underscores, 1 to 32 characters in all. *Reason:* no key has a default, so a missing table is an error, but a project may be set up before its first study. A run against no study is refused by R1.
 2. **C2. Paths.** Every path in the config (`ledger`, `runs_dir`, `holdout_files`, `restricted_files`, `spec_files`, `risk_free`) is relative, uses forward slashes, and does not resolve outside the repository.
 3. **C3. Study budget.** Each study's `budget` is a whole number, zero or more.
 4. **C4. Study prefix.** Each study's `prefix` is 2 to 4 uppercase letters.
@@ -746,18 +752,18 @@ At the end, the loader raises one `ConfigErrorGroup` (a subclass of `ExceptionGr
     - With `holdout = false`, `holdout_files`, `restricted_files` and `custodian` are errors.
     
     *Reason:* the holdout is only a test if the two samples cannot overlap, and a missing key must never mean "no holdout" by accident.
-12. **C12. Chain registry.** `[project.chains]` holds one table per writer. Its code is an uppercase letter followed by uppercase letters or digits, 2 to 6 characters long, with no code appearing twice. Each entry has `person` (non-empty) and `key`: the text `ed25519:` followed by the standard base64 encoding of the 32-byte raw public key, which must decode to exactly 32 bytes. The registry is non-empty. Each registered chain's file lives in `ledger`.
+12. **C12. Chain registry.** `[project.chains]` holds one table per writer. Its code is an uppercase letter followed by uppercase letters or digits, 2 to 6 characters long, with no code appearing twice. Each entry has `person` (non-empty) and `key`: the text `ed25519:` followed by the standard base64 encoding of the 32-byte raw public key, which must decode to exactly 32 bytes and be exactly the encoding of those bytes. No public key appears in two entries; the later entry in the file is the error. The registry is non-empty. Each registered chain's file lives in `ledger`.
 13. **C13. Prior trials.** Every study declares `prior_trials`, a whole number, zero or more, even when it is 0.
 14. **C14. Mode.** `[project] mode` is `solo` or `team`. In `team` mode, every study with a holdout declares a `custodian`, and witnessing is on (C17).
 15. **C15. Custodian.** `custodian`, when present, names a `person` in the registry. In `solo` mode it may be absent. The gate checks that the custodian ran none of the study's design runs (G2).
 16. **C16. Returns.** Every study has a `[returns]` table with:
     - `periods_per_year`: a whole number, at least 1;
     - `basis`: a non-empty description of what a return is measured on;
-    - `risk_free`: a path to a file of per-period risk-free returns on the study's grid, or `"none"`. With `"none"`, `risk_free_reasoning` is a required non-empty string.
+    - `risk_free`: a path to a file of per-period risk-free returns on the study's grid, or `"none"`. With `"none"`, `risk_free_reasoning` is a required non-empty string. With a path, `risk_free_reasoning` is an error.
 17. **C17. Witness.** `[project.witness]` holds `rekor_url` (an HTTPS URL) and `ots_calendars` (a non-empty list of HTTPS URLs). A `solo` project may instead set `witness = false` under `[project]`. A `team` project may not.
 18. **C18. Spec files.** Every study declares `spec_files`, a list of paths, which may be empty.
 19. **C19. Canonical values.** A decimal key's value is converted to a float and written as Python's shortest round-trip text for that float (its `repr`), stored as a string. Integers are written as integers. Dates are ISO 8601 text. The canonical study table used by the lock contains no JSON floats. *Reason:* the shortest round-trip text of a float is the same on every platform, so the lock reproduces the same bytes on every machine.
-20. **C20. Placeholders.** A basis text, a `key`, a calendar URL or the Rekor URL that equals one of BGL's documented placeholder strings, or contains `<` or `>`, is an error. *Reason:* an unedited template must not load.
+20. **C20. Placeholders.** A free-text value (a gate basis `text`, a returns `basis` or `risk_free_reasoning`), a `key`, a calendar URL or the Rekor URL that contains the placeholder marker `TODO(bgl)` (case-sensitive) is an error. Every placeholder in BGL's templates and documentation contains this marker. A value that fails C20 gets no further check for that key, so a template key reports C20 rather than C12. *Reason:* an unedited template must not load, and angle brackets alone would reject ordinary reasoning such as `PBO < 0.5`.
 
 ## Python API
 
