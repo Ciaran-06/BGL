@@ -8,7 +8,9 @@ authors = [
     { name = "Ciaran Gaffney", email = "ciaran.gaffney@icloud.com" }
 ]
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    "cryptography>=50.0.2",
+]
 
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]
