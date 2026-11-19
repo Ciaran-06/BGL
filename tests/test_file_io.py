@@ -3,9 +3,9 @@ import sys
 from pathlib import Path
 
 import pytest
-from bgl.file_io import atomic_write, create_exclusive, fsync_dir
 
 from bgl import file_io
+from bgl.file_io import atomic_write, create_exclusive, fsync_dir
 
 
 class TestAtomicWrite:
