@@ -83,12 +83,21 @@ An independent review found 8 critical and 16 major problems. Most had one root:
 | N2 | C1 also requires a `[project]` table and a `[studies]` table, which may be empty. An empty file gives two C1 errors | C1 |
 | N3 | Every placeholder in BGL's templates and documentation contains the marker `TODO(bgl)`. C20 rejects any checked value containing it. Angle brackets are allowed, so basis text may contain inequalities such as `PBO < 0.5` | C20; File formats |
 | N4 | No public key appears twice in the registry. Study names are snake_case, 1 to 32 characters. `risk_free_reasoning` is an error when `risk_free` is a path. C20 covers every free-text value: gate basis texts, the returns `basis` and `risk_free_reasoning` | C1; C12; C16; C20 |
+| N5 | Claim names follow the study-name format. Paths are compared and stored in tidied form, and a path listed twice in one list is an error | Shared checks; C5; C11; C18; C19 |
+| N6 | A row signature signs the UTF-8 bytes of `bgl-row-v1:` followed by the row's hash, and is written as standard base64. Every row carries exactly the fields of its `format_version`, with null for unused ones; a missing or extra field fails `verify` | R15; Ledger |
+| N7 | Each ledger line is the row's canonical JSON (with `hash` and `sig`, same settings as the hashed bytes) followed by `\n`, and `verify` fails a line in any other form. A `.jsonl` file in the ledger folder that is not a registered chain fails `verify` and G5 | Ledger; R15; G5; `verify` |
 
 *Reason for N1:* the statistics are floats, so keeping config numbers as floats avoids converting between types, and a harmless reformat (`0.95` to `0.950`) no longer looks like a change to a locked value.
 
 *Reason for N3:* the rule exists so that an unedited template does not load. BGL writes the templates, so it can mark them in a way that is easy to detect: a half-edited template is still caught, and ordinary reasoning text never is. The earlier wording also referred to a list of placeholder strings that the spec never gave.
 
 *Reason for N4:* discard detection lists Rekor entries by public key, so two chains sharing a key would each look as if heads were missing from the other, and a signature would no longer say which writer wrote a row. Study names appear in commands, rows and key paths, so they must need no shell quoting and contain no dots. A reasoning left behind after switching to a file would describe a choice the study no longer makes.
+
+*Reason for N5:* claims are typed in commands and stored in rows, like study names. Without tidying, `data/./x` would slip past C11's overlap check, and a harmless reformat of a path would look like a change to a locked value. A path listed twice is almost always a copy-paste slip.
+
+*Reason for N6:* the writer's key also signs Rekor entries over head hashes, and a head hash is a row hash, so without the prefix a row signature and a Rekor signature could be the same message and one could be passed off as the other. The prefix also binds the format version. Base64 matches how keys are written. A fixed field set means the canonical bytes never depend on which code path built a row, and a field added by hand is caught.
+
+*Reason for N7:* JSON allows a key to appear twice and parsers keep only one value, so without the line check a line could be edited without changing the row it parses to. With it, every row has exactly one valid spelling. The registry only grows, so a chain file with no registry entry is either a stray or a chain being hidden; either must stop the gate.
 
 ### Earlier revisions (18 Nov 2026; superseded where they conflict with the batch above)
 
@@ -471,7 +480,7 @@ From the open row on, every outcome except a refusal uses budget, because the re
 - **R15. Hash chain and signatures.** Each row stores:
   - `prev_hash`, the previous row's hash in the same chain;
   - `hash`, the SHA-256 of the row's canonical JSON without `hash` and `sig`;
-  - `sig`, an Ed25519 signature of the hash by the writer's key.
+  - `sig`, the writer's Ed25519 signature of the UTF-8 bytes of `bgl-row-v1:` followed by `hash`, written as standard base64.
   
   An open row stores its manifest's hash. A close row stores the hashes of its close file, return series file and captured output. `verify` recomputes every hash, checks every signature against the registry, and reports the first broken row in each chain.
 - **R16. Unique IDs.** A run ID is `<prefix>-<letter><counter>-<CODE>`, for example `AL-R007-CG1`.
@@ -604,7 +613,9 @@ The numbers and texts in this example show the format. They are not recommended 
 
 - *Reason for JSON Lines over CSV:* rows can hold nested values, each line is independent so appending never touches earlier rows, and line-by-line git diffs show exactly what was added. A CSV export is a command (`list --csv`).
 - *Reason for `event` and `type` as separate fields:* a run has an open row and a close row, so the row kind and the run type cannot share one field.
-- **Canonical bytes.** The bytes hashed are `json.dumps(row, sort_keys=True, separators=(',', ':'), ensure_ascii=False)` without `hash` and `sig`, encoded as UTF-8. Hashed fields hold no JSON floats: every non-integer number is stored as a string in its canonical text (C19), so every implementation writes the same bytes.
+- **Canonical bytes.** The bytes hashed are `json.dumps(row, sort_keys=True, separators=(',', ':'), ensure_ascii=False)` without `hash` and `sig`, encoded as UTF-8. Hashed fields hold no JSON floats: every non-integer number is stored as a string in its canonical text (C19), so every implementation writes the same bytes. Hashes are lowercase hex.
+- **Lines.** Each line is the row's canonical JSON with `hash` and `sig` included, using the same settings, followed by `\n`. `verify` fails a line in any other form, so a row has exactly one valid spelling.
+- **Fields.** Every row carries exactly the fields in the table below for its `format_version`, with null for any field its event does not use. A missing or extra field fails `verify`.
 
 **Events:** `open`, `close`, `refused`, `dry`, `note`, `ack`, `void`, `lock`, `amend`, `repair`, `seal`, `imported`, `incubation`, `live_return`, `gate`, `registration`.
 
@@ -653,7 +664,7 @@ The numbers and texts in this example show the format. They are not recommended 
 | `format_version` | integer | Format version of this row |
 | `prev_hash` | text | The previous row's `hash` in this chain (64 zeros for the first row) |
 | `hash` | text | SHA-256 of the canonical bytes |
-| `sig` | text | Ed25519 signature of `hash` by the writer's key |
+| `sig` | text | Ed25519 signature of `bgl-row-v1:` + `hash` by the writer's key, standard base64 |
 
 Refused runs get one `refused` row and never use budget. *Reason:* a refusal is evidence that the rules worked.
 
@@ -722,7 +733,7 @@ At the end, the loader raises one `ConfigErrorGroup` (a subclass of `ExceptionGr
 
 - *Whole numbers* (`budget`, `prior_trials`, `cscv_blocks`, `periods_per_year` and every other count) use one check: an integer, not a boolean, at least the stated minimum. *Reason:* in Python a boolean counts as an integer, so `budget = true` would otherwise pass as 1.
 - *Decimals* are Python floats, `tomllib`'s default. A key that takes a decimal also accepts a TOML integer, which is converted to a float, so `cost_bps = 5` and `cost_bps = 5.0` are the same value. Booleans are refused. *Reason:* the statistics are computed in floats, so config values never have to be converted between number types, and a harmless reformat such as `0.95` to `0.950` gives the same value and the same lock.
-- *Paths* use C2's checks.
+- *Paths* use C2's checks. Each path is tidied before it is compared or stored: `.` segments, `name/..` pairs, repeated slashes and a trailing slash are removed, so `data/./raw/` becomes `data/raw`. A path listed twice in one list (after tidying) is an error under that list's own rule (C11 or C18), reported at the later entry.
 - *Non-finite numbers:* TOML allows `nan` and `inf`. Both are rejected wherever a number is expected. *Reason:* every comparison with nan is false, so a nan threshold would silently pass or fail everything.
 - *Boundaries:* every range in these rules states whether each end is included. Each range has a test at its exact boundary.
 
@@ -732,7 +743,7 @@ At the end, the loader raises one `ConfigErrorGroup` (a subclass of `ExceptionGr
 2. **C2. Paths.** Every path in the config (`ledger`, `runs_dir`, `holdout_files`, `restricted_files`, `spec_files`, `risk_free`) is relative, uses forward slashes, and does not resolve outside the repository.
 3. **C3. Study budget.** Each study's `budget` is a whole number, zero or more.
 4. **C4. Study prefix.** Each study's `prefix` is 2 to 4 uppercase letters.
-5. **C5. Claims.** Each study's `claims` is a list of unique, non-empty strings. An empty list is allowed. Claim names are scoped to their study.
+5. **C5. Claims.** Each study's `claims` is a list of unique claim names. Each name is a lowercase letter followed by lowercase letters, digits or underscores, 1 to 32 characters in all. An empty list is allowed. Claim names are scoped to their study.
 6. **C6. Unique prefixes.** No two studies share a prefix. *Reason:* run IDs must be unique across the project (R16).
 7. **C7. Unknown keys.** A key the loader does not recognise is an error. *Reason:* a misspelt key such as `budgt = 20` would otherwise be ignored silently.
 8. **C8. Missing or unreadable file.** If `bgl.toml` does not exist, the error tells the user to run `bgl init`. A folder at that path, or a file that cannot be read, is also C8.
@@ -748,7 +759,7 @@ At the end, the loader raises one `ConfigErrorGroup` (a subclass of `ExceptionGr
     
     *Reason for the 0.5 cap:* above 0.5, a study would pass even when picking its best trial does worse than chance.
 11. **C11. Holdout.** Every study declares exactly one of `holdout_start` (an unquoted TOML date, no time) or `holdout = false`.
-    - With `holdout_start`, `holdout_files` is a non-empty list of paths, and `restricted_files` is a list of paths, which may be empty. The two lists share no path.
+    - With `holdout_start`, `holdout_files` is a non-empty list of paths, and `restricted_files` is a list of paths, which may be empty. The two lists share no path, compared after tidying.
     - With `holdout = false`, `holdout_files`, `restricted_files` and `custodian` are errors.
     
     *Reason:* the holdout is only a test if the two samples cannot overlap, and a missing key must never mean "no holdout" by accident.
@@ -839,7 +850,8 @@ The command-line tool never creates a run; runs are made only by scripts through
 
 **`verify` checks:**
 
-- every chain's hashes and signatures, and that no torn tail exists;
+- every chain's lines, hashes and signatures, and that no torn tail exists;
+- that the ledger folder holds no `.jsonl` file outside the registry;
 - that every close row has an open row, and every open row has a close row or is in progress on this machine;
 - late closes, each flagged until acknowledged;
 - that every manifest, close file, return series and captured output matches its hash (or is reported not checkable where missing);
@@ -954,7 +966,7 @@ The gate answers one question: may this study's strategy be deployed with real m
 - **G3. Every run closed.** No unclosed or in-progress run. Every late close is acknowledged by an `ack` row.
 - **G4. Holdout looked at once.** Across all chains, at most one holdout run exposed holdout-derived output, voided runs included, unless the record proves no exposure (R6). Holdout runs were made by the custodian when one is declared. A second exposure fails G4 with "holdout opened twice".
 - **G5. Cross-chain recount.** Over the union of all registered chains:
-  - every registered chain is present, verifies, and has rows from one machine;
+  - every registered chain is present, verifies, and has rows from one machine, and the ledger folder holds no other `.jsonl` file;
   - every `other_heads` hash appears in its chain;
   - counted opens are within budget plus amendments;
   - each claim was decided by at most one confirmatory run;
