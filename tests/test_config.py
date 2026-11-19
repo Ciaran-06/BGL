@@ -832,6 +832,10 @@ class TestCheckProject:
                 {"runs_dir": "../out"}, "C2", "project.runs_dir", id="runs_dir_escapes"
             ),
             pytest.param({"mode": "Team"}, "C14", "project.mode", id="mode_case"),
+            pytest.param({"ledger": "."}, "C2", "project.ledger", id="ledger_is_root"),
+            pytest.param(
+                {"runs_dir": "bgl/.."}, "C2", "project.runs_dir", id="runs_dir_is_root"
+            ),
         ],
     )
     def test_one_bad_field(self, change: dict[str, Any], rule: str, key: str) -> None:

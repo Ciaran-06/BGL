@@ -281,17 +281,27 @@ def verify_all_chains(root: Path, project: Project) -> LedgerReport:
     Runs under the ledger lock (R18), so no append can land halfway through.
     """
     with ledger_lock(root):
-        chains = {
-            code: verify_chain(*read_chain(chain_path(root, project, code)), writer)
-            for code, writer in project.writers.items()
-        }
-        # [DECISION] Only *.jsonl directly in the ledger folder count. Names are
-        # compared exactly, so cg1.jsonl is unregistered when the code is CG1.
-        unregistered = tuple(
-            path.name
-            for path in chain_files(root, project)
-            if path.stem not in project.writers
-        )
+        return verify_all_chains_unlocked(root, project)
+
+
+def verify_all_chains_unlocked(root: Path, project: Project) -> LedgerReport:
+    """verify_all_chains for a caller that already holds the ledger lock.
+
+    [DECISION] The run lifecycle holds the ledger lock from its pre-open checks
+    through the open row, so a second process cannot use the same budget unit
+    or run ID in between. Locks are not reentrant, hence the unlocked variants.
+    """
+    chains = {
+        code: verify_chain(*read_chain(chain_path(root, project, code)), writer)
+        for code, writer in project.writers.items()
+    }
+    # [DECISION] Only *.jsonl directly in the ledger folder count. Names are
+    # compared exactly, so cg1.jsonl is unregistered when the code is CG1.
+    unregistered = tuple(
+        path.name
+        for path in chain_files(root, project)
+        if path.stem not in project.writers
+    )
     return LedgerReport(chains=chains, unregistered=unregistered)
 
 
@@ -308,17 +318,30 @@ def append_row(
     verified head and appends it. Raises ChainBrokenError on any problem,
     including a torn tail, without touching the file.
     """
-    merged = _with_chain_code(fields, writer)
     with ledger_lock(root):
-        path = chain_path(root, project, writer.code)
-        lines, tail = read_chain(path)
-        report = verify_chain(lines, tail, writer)
-        if report.problem is not None:
-            raise ChainBrokenError(
-                writer.code, report.problem.line, report.problem.reason
-            )
-        row = build_row(merged, report.head, private_key)
-        append_line(path, line_bytes(row))
+        return append_row_unlocked(root, project, writer, private_key, fields)
+
+
+def append_row_unlocked(
+    root: Path,
+    project: Project,
+    writer: Writer,
+    private_key: Ed25519PrivateKey,
+    fields: Mapping[str, Any],
+) -> dict[str, Any]:
+    """append_row for a caller that already holds the ledger lock.
+
+    Still verifies the writer's whole chain first (R7): holding the lock is no
+    reason to trust the file.
+    """
+    merged = _with_chain_code(fields, writer)
+    path = chain_path(root, project, writer.code)
+    lines, tail = read_chain(path)
+    report = verify_chain(lines, tail, writer)
+    if report.problem is not None:
+        raise ChainBrokenError(writer.code, report.problem.line, report.problem.reason)
+    row = build_row(merged, report.head, private_key)
+    append_line(path, line_bytes(row))
     return row
 
 

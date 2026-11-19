@@ -573,8 +573,8 @@ def check_project(collector: ErrorCollector, data: Mapping[str, Any]) -> Project
     check_unknown_keys(collector, project, _PROJECT_KEYS, "project")
     name = check_string(collector, project, "name", "project", "C1")
     mode = check_mode(collector, project)
-    ledger = check_path(collector, project, "ledger", "project")
-    runs_dir = check_path(collector, project, "runs_dir", "project")
+    ledger = _check_bgl_folder(collector, project, "ledger")
+    runs_dir = _check_bgl_folder(collector, project, "runs_dir")
     writers = check_registry(collector, project)
     witness_valid, witness = check_witness(collector, project, mode)
     return ProjectParts(
@@ -586,6 +586,26 @@ def check_project(collector: ErrorCollector, data: Mapping[str, Any]) -> Project
         witness_valid=witness_valid,
         witness=witness,
     )
+
+
+def _check_bgl_folder(
+    collector: ErrorCollector, project: Mapping[str, Any], key: str
+) -> str | None:
+    """C2 for ledger and runs_dir, which also may not be the repository root.
+
+    [DECISION] R3 ignores uncommitted changes under these two folders. If either
+    were the repository root, R3 would ignore every file, so "." is refused.
+    """
+    path = check_path(collector, project, key, "project")
+    if path == ".":
+        collector.add(
+            "C2",
+            "a folder inside the repository, not the repository root",
+            key=key_path("project", key),
+            found=project.get(key),
+        )
+        return None
+    return path
 
 
 def check_mode(collector: ErrorCollector, project: Mapping[str, Any]) -> Mode | None:

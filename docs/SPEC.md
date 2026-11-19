@@ -27,7 +27,7 @@ An independent review found 8 critical and 16 major problems. Most had one root:
 | 15 | A gate table added after the lock is never deployment-grade | G1 |
 | 16 | Dry runs run the script on fixtures, block every other read by default, and leave a `dry` row | R25 |
 | 17 | The gate deflates the selected design variant and tests the holdout run against zero. V is floored at the null variance (BGL's choice). N = 1 gives a hurdle of zero. Missing series are reported, and N keeps the penalty | Statistics |
-| 18 | MinTRL report-only; R17 by module scan; torn-tail repair; orphan IDs never reused; duplicates judged on recorded facts; `counts` derived from `type`; declared claim outcomes; rule classes | R4, R14, R16, R17; Statistics |
+| 18 | MinTRL report-only; R17 by module scan (superseded by N9: hook first, scan second); torn-tail repair; orphan IDs never reused; duplicates judged on recorded facts; `counts` derived from `type`; declared claim outcomes; rule classes | R4, R14, R16, R17; Statistics |
 | A | A small set of pinned dependencies (`cryptography`, `opentimestamps`, `numpy`), and Ed25519 signatures on ledger rows | Packaging; R15 |
 | B | Solo projects may run without a custodian. Team projects must declare one. Deployment-grade requires one | C14, C15; G2 |
 | C | The whole library is v0.1; the GUI is v0.2 | Roadmap |
@@ -86,6 +86,8 @@ An independent review found 8 critical and 16 major problems. Most had one root:
 | N5 | Claim names follow the study-name format. Paths are compared and stored in tidied form, and a path listed twice in one list is an error | Shared checks; C5; C11; C18; C19 |
 | N6 | A row signature signs the UTF-8 bytes of `bgl-row-v1:` followed by the row's hash, and is written as standard base64. Every row carries exactly the fields of its `format_version`, with null for unused ones; a missing or extra field fails `verify` | R15; Ledger |
 | N7 | Each ledger line is the row's canonical JSON (with `hash` and `sig`, same settings as the hashed bytes) followed by `\n`, and `verify` fails a line in any other form. A `.jsonl` file in the ledger folder that is not a registered chain fails `verify` and G5 | Ledger; R15; G5; `verify` |
+| N8 | R3 exempts the whole ledger folder and `runs_dir`. The code fingerprint is the SHA-256 of the canonical JSON of `[[path, blob_hash], ...]` for every `.py` blob in the run's commit, sorted by path. A commit is reachable if any branch, remote-tracking branch or tag contains it. A run with no git user configured is refused | R3; R4; Supported git workflow; `user` |
+| N9 | From the audit-hook spike (`docs/spikes/audit-hook.md`): R17 uses the hook's `open` and `exec` events, with the loaded-module scan as a second check at close. Native readers (pyarrow's own readers, polars and any C, C++ or Rust reader) are a declared limit, and sealing is the holdout's real protection. Hook-based checks cover the main process only; the close file records the process starts the hook saw and whether a worker-pool module was loaded | R8; R17; R20; R25; Threat model; Close file |
 
 *Reason for N1:* the statistics are floats, so keeping config numbers as floats avoids converting between types, and a harmless reformat (`0.95` to `0.950`) no longer looks like a change to a locked value.
 
@@ -98,6 +100,10 @@ An independent review found 8 critical and 16 major problems. Most had one root:
 *Reason for N6:* the writer's key also signs Rekor entries over head hashes, and a head hash is a row hash, so without the prefix a row signature and a Rekor signature could be the same message and one could be passed off as the other. The prefix also binds the format version. Base64 matches how keys are written. A fixed field set means the canonical bytes never depend on which code path built a row, and a field added by hand is caught.
 
 *Reason for N7:* JSON allows a key to appear twice and parsers keep only one value, so without the line check a line could be edited without changing the row it parses to. With it, every row has exactly one valid spelling. The registry only grows, so a chain file with no registry entry is either a stray or a chain being hidden; either must stop the gate.
+
+*Reason for N8:* every file BGL writes lives in the ledger folder or `runs_dir`, so exempting both needs no spec change when a new BGL folder appears. The fingerprint reuses the canonical JSON already pinned for every other hash, and taking the blobs from the commit means `verify` can recompute it from history alone. Branches, remote branches and tags all protect a commit from garbage collection. Git itself needs a user to commit, so every row should name one.
+
+*Reason for N9:* the spike showed the module scan finds only a plain import, while the hook's events caught all six ways of loading code that were tried. Audit hooks only see reads that go through the Python runtime, so a reader written in C++ or Rust is invisible and cannot be blocked; only encryption keeps such a reader from the holdout. Worker processes run without the parent's hook, and `multiprocessing` workers started with `spawn` or `forkserver` are not even seen starting, so the record says what was seen and labels the rest.
 
 ### Earlier revisions (18 Nov 2026; superseded where they conflict with the batch above)
 
@@ -205,7 +211,8 @@ v0.1 is the whole library: runs, ledger, writers, witness, custodian sealing, st
 - **When, without a witness.** Times in rows are self-reported. A stamped head proves the rows existed by a Bitcoin block's time.
 - **Discards before witnessing.** A run whose open was never witnessed (because it ran offline) could have been thrown away without trace. Such runs are marked unwitnessed, and a study containing one is not deployment-grade.
 - **Anything, if the transparency log is unavailable or dishonest.** BGL relies on the public Rekor instance being available. Its entries carry inclusion proofs, and its history carries consistency proofs, so a log that rewrote its history would be detectable, but a log that refused submissions would leave runs unwitnessed.
-- **Reads outside Python.** Files opened by C extensions such as pyarrow may not be seen (see the audit-hook spike in the build order).
+- **Reads outside Python.** The audit hook sees reads made through the Python runtime: `open`, `pathlib`, `os.open`, `mmap`, sqlite, numpy and pandas (which opens files itself, even for parquet). It cannot see or block readers that open files in native code: pyarrow's own readers, polars, and any C, C++ or Rust reader. For those, R8's record and the dry-run block are declared, and the sealed holdout is the protection (N9, `docs/spikes/audit-hook.md`).
+- **Worker processes.** Hook-based checks (R8, R17, R20's hook clause, R25's block) cover the run's main process only. The close file records the process starts the hook saw, and whether `multiprocessing` or `concurrent.futures` was loaded, because `multiprocessing` workers started with `spawn` or `forkserver` are not seen starting.
 - **Public data.** Sealing a holdout file does not stop a researcher downloading public data for the holdout period again.
 - **Who has held the raw data.** If the researcher held the full history before the split, sealing proves only that BGL-governed runs did not read the holdout. The gate report says who did the split.
 - **Locks on synced or network folders.** Locks are unreliable there, so projects should not sit in them. `init` warns.
@@ -272,7 +279,7 @@ Every rule below states its class. A rule with parts in different classes says w
 - **One writer per chain.** Each chain is `<ledger>/<CODE>.jsonl`. Only its writer appends to it, and every other chain on a machine is read-only there.
 - **Signatures.** Every row is signed with its writer's key (R15). The `user` field from git is self-reported; the signature says which registered writer wrote the row.
 - **The registry only grows.** After a study's first lock, writers can be added to the registry, but existing entries never change or disappear. A lost or replaced key means a new chain code. The documentation tells every writer to back up their key, and a custodian especially, because a lost custodian key blocks a handover after sealing.
-- **Machine identity.** Lock checks and the "another machine" test use the machine ID, never the hostname. `verify` fails a chain that has rows from two machine IDs.
+- **Machine identity.** Lock checks and the "another machine" test use the machine ID, never the hostname. `verify` fails a chain that has rows from two machine IDs, or a row whose `machine_id` is not a non-empty string.
 
 *Reason:* a laptop and a server appending to one chain would need a hand merge, which is the failure separate chains exist to remove. Signing the rows ties each row to a writer, which a signature on the code commit does not do.
 
@@ -409,12 +416,12 @@ Pre-open checks run in the order of the table. A failure writes one `refused` ro
 - **R7. Chain intact.** The writer's own chain must verify (hashes, signatures, no torn tail) before any row is added: open, close, note, refused or any other. A broken chain belonging to another writer does not block this writer. `status` and `verify` report it, and it fails the gate (G5).
 - **R1. Known study.** The study is declared in `bgl.toml`.
 - **R22. Study lock.** If the study has no lock row yet and the run is counted, the run writes the lock row before its open row. If a lock exists, the current study table and registry must equal the locked values plus any accepted amendments. Changed spec files need an `amend` row, or a confirmatory run is refused.
-- **R3. Clean code.** The git working tree has no uncommitted changes to tracked files, except BGL's own files: chains, proofs and `runs_dir`. The script must be tracked and unchanged. The current commit is recorded. Untracked data files are allowed. `status` warns if the ledger has uncommitted rows.
+- **R3. Clean code.** The git working tree has no uncommitted changes, staged or not, to tracked files, except BGL's own files: everything under the ledger folder and `runs_dir`. The script must be tracked and unchanged. The current commit is recorded. Untracked data files are allowed. `status` warns if the ledger has uncommitted rows.
 - **R3b. No untracked Python files.** `git ls-files --others --exclude-standard -- '*.py'` must return nothing. The refusal names each offending file and both fixes, for example: `Refused (R3b): untracked Python files in the repo: notebooks/try.py. Commit them, or move them to scratch/ (ignored by git).`
 - **R17 at open.** Every loaded module whose file is inside the repository must be tracked by git. This scan also catches modules imported above the `with` block, and files in ignored folders such as `scratch/`.
 - **R8. Inputs declared.** The run declares its input files. Each must exist, and its size and SHA-256 are stored in the open manifest. Paths are stored with forward slashes. A missing input refuses the run.
 - **R4. No duplicate (counted runs only).** An earlier counted open in the same study with the same script hash, code fingerprint, config hash and input hashes refuses the run.
-  - The code fingerprint is the SHA-256 over the sorted paths and blob hashes of every tracked `.py` file, excluding BGL's files.
+  - The code fingerprint is the SHA-256 of the canonical JSON of `[[path, blob_hash], ...]` for every `.py` blob in the run's commit, sorted by path, excluding BGL's files (N8).
   - `what_changed` must be non-empty, but is not compared.
   - An exact rerun, for example to check reproducibility, is an exploratory run.
   
@@ -445,7 +452,7 @@ Pre-open checks run in the order of the table. A failure writes one `refused` ro
   - A design run is refused if any declared input is a holdout file, a restricted file or a tainted file.
   - After the lock, any run declaring a restricted file is refused.
   - `sample = live` is only for replay runs during incubation, by the custodian when one is declared.
-  - The audit hook closes a run as `invalid` if it opens a holdout or restricted file it may not read.
+  - The audit hook closes a run as `invalid` if it opens a holdout or restricted file it may not read. This sees reads through Python only; native readers are kept out by sealing (N9).
   - Sample dates are declared: design runs must end before `holdout_start`, and holdout runs must start on or after it.
 - **R2. Budget.** A counted run is allowed only while the study's counted opens are fewer than its budget plus accepted increases. Budget counts counted opens in every chain on this machine. Exploratory and data runs use no budget.
 
@@ -462,11 +469,12 @@ From the open row on, every outcome except a refusal uses budget, because the re
 **While the run is open**
 
 - Output is captured for every counted run: stdout and stderr, each to its own git-ignored file.
-- The audit hook records files opened through Python that were not declared (R8).
+- The audit hook records files opened through Python that were not declared (R8). Native readers and worker processes are not seen (see the threat model).
+- **R17 during the run.** The audit hook records every Python source or compiled file (`.py`, `.pyc`) inside the repository that the run opens or executes (`open` and `exec` events). Any that is not tracked closes the run as `invalid`, with the file path as the reason.
 
 **When the run ends**
 
-- **R17 at close.** The loaded-module scan runs again. An untracked module inside the repository closes the run as `invalid`, with the file path as the reason. Code outside the repository and worker processes are not checked.
+- **R17 at close.** The loaded-module scan runs again as a second check. An untracked module inside the repository closes the run as `invalid`, with the file path as the reason. Code outside the repository and worker processes are not checked.
 - **R10. Always recorded.** A finished run gets a close row. An exception closes it as `crashed`, with the error, and is re-raised. Ctrl+C closes it as `interrupted`. If the run was already closed by `abandon`, the normal close is still written, and `verify` reports it as a late close.
 - **R11. Result required.** A run that finishes without a result is closed as `no_result`, not `ok`.
 - **R12. Counts as used.** Budget used at open stays used, whatever the status or any void. A voided run's variants stay in N.
@@ -496,7 +504,7 @@ From the open row on, every outcome except a refusal uses budget, because the re
 
 - While it runs, the audit hook blocks any file open except Python source and compiled files, files inside the Python installation and site-packages, and the declared fixtures.
 - It writes a `dry` row, which uses no budget, and nothing else.
-- C-level readers may get past the hook. The `dry` row keeps the attempt on record.
+- Native readers (pyarrow's own readers, polars) and worker processes get past the hook (N9). The `dry` row keeps the attempt on record.
 
 *Reason:* developers need to test a script's body, but a dry run that could read real data would be an unlogged look at it. Testing analysis functions with ordinary pytest fixtures, outside BGL, is the recommended pattern.
 
@@ -640,7 +648,7 @@ The numbers and texts in this example show the format. They are not recommended 
 | `outcome` | object or null | Confirmatory close rows: each claim mapped to `supported`, `not_supported` or `inconclusive` (declared) |
 | `result` | text or null | Close rows: the summary the script set |
 | `commit` | text | Git commit the run used |
-| `user` | text | Git user name and email. Self-reported; the row signature says which writer wrote the row |
+| `user` | text | Git user name and email, as `Name <email>`. Self-reported; the row signature says which writer wrote the row. A run with no git user configured is refused |
 | `commit_signature` | text | Git's status code for the commit signature (`G`, `B`, `U`, `N`). For information only |
 | `machine_id` | text | The writer's machine ID. Used for lock checks |
 | `host`, `pid` | text, integer | For information only |
@@ -680,7 +688,8 @@ Refused runs get one `refused` row and never use budget. *Reason:* a refusal is 
 
 - `outputs`: each declared output's path and SHA-256.
 - `files_opened`: files opened through Python during the run that were not declared (R8).
-- `untracked_modules`: the result of the R17 scan at close.
+- `untracked_modules`: the untracked repository code the hook saw opened or executed, and the result of the R17 scan at close.
+- `processes`: the process starts the hook saw (`subprocess.Popen`, `os.system`, `os.fork` and the like), and whether `multiprocessing` or `concurrent.futures` was loaded (N9).
 - `notes`: remarks added with `run.note`. A note is lost if the run is hard-killed before close.
 - `error`: type, message and traceback, for crashed runs.
 - `output`: the captured stdout and stderr files, their SHA-256, and the holdout load position in each stream.
@@ -709,7 +718,7 @@ Refused runs get one `refused` row and never use budget. *Reason:* a refusal is 
 
 **Line endings and paths.** `init` adds entries to `.gitattributes` that turn off line-ending conversion for the ledger folder and `runs_dir`, so hashed files never change bytes in git. Every stored path uses forward slashes.
 
-**Supported git workflow.** Commits that runs used must stay reachable: branches carrying them are merged or fast-forwarded, never squashed or rebased, and CI checks out full history. `verify` reports an unreachable commit as its own failure ("commit not reachable"), with this explanation.
+**Supported git workflow.** Commits that runs used must stay reachable, meaning some branch, remote-tracking branch or tag contains them: branches carrying them are merged or fast-forwarded, never squashed or rebased, and CI checks out full history. `verify` reports an unreachable commit as its own failure ("commit not reachable"), with this explanation.
 
 **The lock file.** On Linux and macOS, a run holds `fcntl.flock` with an exclusive lock; on Windows, `msvcrt.locking`. The lock is held on an open file, not inferred from the file's existence, because a crash leaves the file behind. Locks are unreliable on network drives and inside synced folders (OneDrive, Dropbox, iCloud Drive, Google Drive). `init` warns when the project sits in one.
 
@@ -1194,7 +1203,7 @@ Adopting BGL in a real project is that project's own task, in its own repository
 
 | Item | Needed by |
 | --- | --- |
-| The audit hook's view of pyarrow reads and loaded modules | Step 5 |
+| ~~The audit hook's view of pyarrow reads and loaded modules~~ | Done in step 5: N9 |
 | Whether Rekor's v2 API still lists entries by public key; whether it accepts Ed25519-signed hash entries; its rate limits. If listing is unavailable, use the fallback in Witness | Step 8 |
 | The OpenTimestamps calendar API and the `opentimestamps` library's verification interface | Step 8 |
 | The authenticated encryption construction for sealing (streamed, from `cryptography`) | Step 9 |
@@ -1215,7 +1224,7 @@ Adopting BGL in a real project is that project's own task, in its own repository
 - Patton, A., Politis, D. N., and White, H. (2009). Correction to "Automatic Block-Length Selection for the Dependent Bootstrap". *Econometric Reviews*, 28(4). *From memory; check before citing.*
 - Politis, D. N., and Romano, J. P. (1994). The Stationary Bootstrap. *Journal of the American Statistical Association*, 89(428). *Check page numbers before citing.*
 - Politis, D. N., and White, H. (2004). Automatic Block-Length Selection for the Dependent Bootstrap. *Econometric Reviews*, 23(1). *From memory; check before citing.*
-- Python PEP 578, Python Runtime Audit Hooks. The `import` audit event fires before the module name is resolved to a file, and its arguments other than the module name may be `None`, which is why R17 scans loaded modules instead.
+- Python PEP 578, Python Runtime Audit Hooks. The `import` audit event fires before the module name is resolved to a file, and its arguments other than the module name may be `None`, so R17 uses the `open` and `exec` events instead, with a loaded-module scan as a second check (N9).
 - OpenTimestamps: the Python client and the `opentimestamps` library.
 - Sigstore Rekor: the public transparency log used for witnessing (rekor.sigstore.dev).
 - Open Science Framework: osf.io.
