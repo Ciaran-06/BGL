@@ -1,20 +1,26 @@
+import base64
+import binascii
 import dataclasses
 import datetime
 import math
 import re
 import tomllib
+import types
+import urllib.parse
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 _MAX_FOUND_LENGTH = 80
 _LINE_IN_MESSAGE = re.compile(r"at line (\d+)")
-
 _POSITION_IN_MESSAGE = re.compile(
     r"\s*\(at (?:line \d+, column \d+|end of document)\)\s*$"
 )
 _UTF8_BOM = b"\xef\xbb\xbf"
 _DRIVE_LETTER = re.compile(r"^[A-Za-z]:")
+_CHAIN_CODE = re.compile(r"[A-Z][A-Z0-9]{1,5}")
+_KEY_PREFIX = "ed25519:"
+_KEY_BYTES = 32
 
 
 class ConfigError(Exception):
@@ -106,45 +112,6 @@ class ErrorCollector:
         """Raise every collected error as one ConfigErrorGroup, in the order found."""
         if self.errors:
             raise ConfigErrorGroup(self.file, self.errors)
-
-
-def read_toml(file: Path) -> dict[str, Any]:
-    """Read and parse bgl.toml. Every failure becomes a ConfigError."""
-    if not isinstance(file, Path):
-        raise TypeError(f"read_toml expects a pathlib.Path, got {type(file).__name__}")
-    if file.is_dir():
-        raise ConfigError(file, "C8", "a file, but this path is a folder")
-
-    try:
-        raw = file.read_bytes()
-    except FileNotFoundError as error:
-        raise ConfigError(
-            file, "C8", "a bgl.toml file (run bgl init to create one)"
-        ) from error
-    except OSError as error:
-        raise ConfigError(
-            file, "C8", f"a readable file ({error.strerror or error})"
-        ) from error
-
-    if raw.startswith(_UTF8_BOM):
-        raise ConfigError(
-            file, "C9", "UTF-8 without a byte-order mark (save the file without a BOM)"
-        )
-
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise ConfigError(file, "C9", "a UTF-8 text file") from error
-
-    try:
-        return tomllib.loads(text)
-    except tomllib.TOMLDecodeError as error:
-        raise ConfigError(
-            file,
-            "C9",
-            f"valid TOML ({_error_text(error)})",
-            line=_error_line(error),
-        ) from error
 
 
 def key_path(table_path: str, key: str) -> str:
@@ -352,14 +319,125 @@ def _path_problem(value: object) -> str | None:
     return None
 
 
+PLACEHOLDER_MARKER = "TODO(bgl)"
+
+
 def check_placeholder(collector: ErrorCollector, value: str, path: str) -> bool:
     """C20: refuse template text. Returns True if value is acceptable."""
-    if "<" in value or ">" in value:
+    if PLACEHOLDER_MARKER in value:
         collector.add(
-            "C20", "real text, not a template placeholder", key=path, found=value
+            "C20",
+            f"real text, not a template placeholder (remove {PLACEHOLDER_MARKER})",
+            key=path,
+            found=value,
         )
         return False
     return True
+
+
+def check_https_url(
+    collector: ErrorCollector,
+    table: Mapping[str, Any],
+    key: str,
+    table_path: str,
+    rule: str,
+) -> str | None:
+    """An HTTPS URL with a host. A placeholder reports C20 and nothing else."""
+    value = table.get(key)
+    path = key_path(table_path, key)
+    if isinstance(value, str) and not check_placeholder(collector, value, path):
+        return None
+    problem = _url_problem(value)
+    if problem is None and isinstance(value, str):
+        return value
+    collector.add(rule, f"an HTTPS URL ({problem})", key=path, found=value)
+    return None
+
+
+def check_https_url_list(
+    collector: ErrorCollector,
+    table: Mapping[str, Any],
+    key: str,
+    table_path: str,
+    rule: str,
+) -> tuple[str, ...] | None:
+    """A non-empty list of HTTPS URLs. Each bad item is reported at path[index]."""
+    value = table.get(key)
+    path = key_path(table_path, key)
+    if not isinstance(value, list) or not value:
+        collector.add(rule, "a list of HTTPS URLs, not empty", key=path, found=value)
+        return None
+    urls: list[str] = []
+    ok = True
+    for index, item in enumerate(value):
+        item_path = f"{path}[{index}]"
+        if isinstance(item, str) and not check_placeholder(collector, item, item_path):
+            ok = False
+            continue
+        problem = _url_problem(item)
+        if problem is None and isinstance(item, str):
+            urls.append(item)
+            continue
+        collector.add(rule, f"an HTTPS URL ({problem})", key=item_path, found=item)
+        ok = False
+    return tuple(urls) if ok else None
+
+
+def _url_problem(value: object) -> str | None:
+    """Why value is not an acceptable HTTPS URL, or None if it is."""
+    if not isinstance(value, str) or not value:
+        return "a non-empty string"
+    if any(char.isspace() or not char.isprintable() for char in value):
+        return "no spaces or control characters"
+    try:
+        parts = urllib.parse.urlsplit(value)
+        parts.port  # noqa: B018  (raises ValueError on a bad port)
+    except ValueError:
+        return "a well-formed URL"
+    if parts.scheme != "https":
+        return "https only"
+    if not parts.hostname:
+        return "a host name"
+    return None
+
+
+def read_toml(file: Path) -> dict[str, Any]:
+    """Read and parse bgl.toml. Every failure becomes a ConfigError."""
+    if not isinstance(file, Path):
+        raise TypeError(f"read_toml expects a pathlib.Path, got {type(file).__name__}")
+    if file.is_dir():
+        raise ConfigError(file, "C8", "a file, but this path is a folder")
+
+    try:
+        raw = file.read_bytes()
+    except FileNotFoundError as error:
+        raise ConfigError(
+            file, "C8", "a bgl.toml file (run bgl init to create one)"
+        ) from error
+    except OSError as error:
+        raise ConfigError(
+            file, "C8", f"a readable file ({error.strerror or error})"
+        ) from error
+
+    if raw.startswith(_UTF8_BOM):
+        raise ConfigError(
+            file, "C9", "UTF-8 without a byte-order mark (save the file without a BOM)"
+        )
+
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ConfigError(file, "C9", "a UTF-8 text file") from error
+
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError as error:
+        raise ConfigError(
+            file,
+            "C9",
+            f"valid TOML ({_error_text(error)})",
+            line=_error_line(error),
+        ) from error
 
 
 def _error_text(error: tomllib.TOMLDecodeError) -> str:
@@ -418,14 +496,79 @@ class Study:
     gate: Gate | None
 
 
+Mode = Literal["solo", "team"]
+
+
+@dataclasses.dataclass(frozen=True)
+class Writer:
+    """One registered writer: a chain code, the person, and their public key (C12)."""
+
+    code: str
+    person: str
+    public_key: bytes
+
+
+@dataclasses.dataclass(frozen=True)
+class Witness:
+    """Where heads are witnessed (C17)."""
+
+    rekor_url: str
+    ots_calendars: tuple[str, ...]
+
+
 @dataclasses.dataclass(frozen=True)
 class Project:
-    """The [project] table (C1, C2, C12)."""
+    """The [project] table (C1, C2, C12, C14, C17).
+
+    ledger and runs_dir are repository-relative paths with forward slashes, as
+    written in bgl.toml; join them to the repository root to use them. witness is
+    None when a solo project sets witness = false.
+    """
 
     name: str
-    ledger: Path
-    runs_dir: Path
-    chains: tuple[str, ...]
+    mode: Mode
+    ledger: str
+    runs_dir: str
+    writers: Mapping[str, Writer]
+    witness: Witness | None
+
+
+@dataclasses.dataclass(frozen=True)
+class ProjectParts:
+    """What check_project found. A field is None when its own check failed.
+
+    Study checks read mode and writers from here, so a mistake elsewhere in
+    [project] does not hide C14 or C15 errors. witness_valid separates
+    "witness = false" (valid, witness None) from an invalid witness setting.
+    """
+
+    name: str | None = None
+    mode: Mode | None = None
+    ledger: str | None = None
+    runs_dir: str | None = None
+    writers: Mapping[str, Writer] | None = None
+    witness_valid: bool = False
+    witness: Witness | None = None
+
+    def build(self) -> Project | None:
+        """The Project record, or None if any part failed."""
+        if (
+            self.name is None
+            or self.mode is None
+            or self.ledger is None
+            or self.runs_dir is None
+            or self.writers is None
+            or not self.witness_valid
+        ):
+            return None
+        return Project(
+            name=self.name,
+            mode=self.mode,
+            ledger=self.ledger,
+            runs_dir=self.runs_dir,
+            writers=self.writers,
+            witness=self.witness,
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -434,6 +577,186 @@ class Config:
 
     project: Project
     studies: Mapping[str, Study]
+
+
+_PROJECT_KEYS = frozenset({"name", "mode", "ledger", "runs_dir", "chains", "witness"})
+_WRITER_KEYS = frozenset({"person", "key"})
+_WITNESS_KEYS = frozenset({"rekor_url", "ots_calendars"})
+
+
+def check_project(collector: ErrorCollector, data: Mapping[str, Any]) -> ProjectParts:
+    """Check the [project] table: C1, C2, C7, C12, C14, C17 and C20."""
+    project = check_table(collector, data, "project", "", "C1")
+    if project is None:
+        return ProjectParts()
+    check_unknown_keys(collector, project, _PROJECT_KEYS, "project")
+    name = check_string(collector, project, "name", "project", "C1")
+    mode = check_mode(collector, project)
+    ledger = check_path(collector, project, "ledger", "project")
+    runs_dir = check_path(collector, project, "runs_dir", "project")
+    writers = check_registry(collector, project)
+    witness_valid, witness = check_witness(collector, project, mode)
+    return ProjectParts(
+        name=name,
+        mode=mode,
+        ledger=ledger,
+        runs_dir=runs_dir,
+        writers=writers,
+        witness_valid=witness_valid,
+        witness=witness,
+    )
+
+
+def check_mode(collector: ErrorCollector, project: Mapping[str, Any]) -> Mode | None:
+    """C14: mode is "solo" or "team"."""
+    value = project.get("mode")
+    if value == "solo":
+        return "solo"
+    if value == "team":
+        return "team"
+    collector.add(
+        "C14", '"solo" or "team"', key=key_path("project", "mode"), found=value
+    )
+    return None
+
+
+def check_registry(
+    collector: ErrorCollector, project: Mapping[str, Any]
+) -> Mapping[str, Writer] | None:
+    """C12: the chain registry. Returns a read-only mapping, or None on any error.
+
+    TOML itself refuses a key written twice, so a duplicate code never reaches here.
+    A public key used twice is reported at the later entry, in file order.
+    """
+    chains = check_table(collector, project, "chains", "project", "C12")
+    if chains is None:
+        return None
+    if not chains:
+        collector.add(
+            "C12",
+            "at least one writer",
+            key=key_path("project", "chains"),
+            found=chains,
+        )
+        return None
+    writers: dict[str, Writer] = {}
+    first_code_for_key: dict[bytes, str] = {}
+    ok = True
+    for code, entry in chains.items():
+        writer = _check_writer(collector, code, entry)
+        if writer is None:
+            ok = False
+            continue
+        first = first_code_for_key.setdefault(writer.public_key, code)
+        if first != code:
+            collector.add(
+                "C12",
+                f"a public key no other writer uses (already used by {first})",
+                key=key_path(key_path("project.chains", code), "key"),
+                found=entry["key"],
+            )
+            ok = False
+            continue
+        writers[code] = writer
+    return types.MappingProxyType(writers) if ok else None
+
+
+def _check_writer(collector: ErrorCollector, code: str, entry: object) -> Writer | None:
+    """One registry entry: its code, then person and key."""
+    path = key_path("project.chains", code)
+    ok = True
+    if not _CHAIN_CODE.fullmatch(code):
+        collector.add(
+            "C12",
+            "a chain code: an uppercase letter, then uppercase letters or digits, "
+            "2 to 6 characters",
+            key=path,
+            found=code,
+        )
+        ok = False
+    if not isinstance(entry, dict):
+        collector.add("C12", "a table with person and key", key=path, found=entry)
+        return None
+    check_unknown_keys(collector, entry, _WRITER_KEYS, path)
+    person = check_string(collector, entry, "person", path, "C12")
+    public_key = check_public_key(collector, entry, path)
+    if not ok or person is None or public_key is None:
+        return None
+    return Writer(code=code, person=person, public_key=public_key)
+
+
+def check_public_key(
+    collector: ErrorCollector, entry: Mapping[str, Any], table_path: str
+) -> bytes | None:
+    """C12 key format, after C20. Returns the 32 raw key bytes.
+
+    The text must be the exact encoding of those bytes, so one key has one
+    spelling in bgl.toml.
+    """
+    value = entry.get("key")
+    path = key_path(table_path, "key")
+    if isinstance(value, str) and not check_placeholder(collector, value, path):
+        return None
+    raw = _decode_public_key(value)
+    if raw is None:
+        collector.add(
+            "C12",
+            f"{_KEY_PREFIX} followed by the base64 of a {_KEY_BYTES}-byte public key "
+            "(as printed by bgl join)",
+            key=path,
+            found=value,
+        )
+    return raw
+
+
+def _decode_public_key(value: object) -> bytes | None:
+    if not isinstance(value, str) or not value.startswith(_KEY_PREFIX):
+        return None
+    text = value[len(_KEY_PREFIX) :]
+    try:
+        raw = base64.b64decode(text, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if len(raw) != _KEY_BYTES or base64.b64encode(raw).decode("ascii") != text:
+        return None
+    return raw
+
+
+def check_witness(
+    collector: ErrorCollector, project: Mapping[str, Any], mode: Mode | None
+) -> tuple[bool, Witness | None]:
+    """C17. Returns (valid, witness); witness is None when witnessing is off.
+
+    witness = false is decided by mode, so with an invalid mode it is neither
+    accepted nor reported (C14 already is).
+    """
+    path = key_path("project", "witness")
+    value = project.get("witness")
+    if value is False:
+        if mode == "solo":
+            return True, None
+        if mode == "team":
+            collector.add(
+                "C17",
+                "a [project.witness] table (team projects must witness)",
+                key=path,
+                found=value,
+            )
+        return False, None
+    if not isinstance(value, dict):
+        collector.add(
+            "C17",
+            "a [project.witness] table, or witness = false in a solo project",
+            key=path,
+            found=value,
+        )
+        return False, None
+    check_unknown_keys(collector, value, _WITNESS_KEYS, path)
+    rekor_url = check_https_url(collector, value, "rekor_url", path, "C17")
+    calendars = check_https_url_list(collector, value, "ots_calendars", path, "C17")
+    if rekor_url is None or calendars is None:
+        return False, None
+    return True, Witness(rekor_url=rekor_url, ots_calendars=calendars)
 
 
 def load_config(file: Path) -> Config:

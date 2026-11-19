@@ -1,6 +1,8 @@
+import base64
 import math
 import os
 import sys
+import types
 from pathlib import Path
 from typing import Any
 
@@ -20,14 +22,22 @@ from bgl.config import (
     ConfigError,
     ConfigErrorGroup,
     ErrorCollector,
+    Mode,
+    check_https_url,
+    check_https_url_list,
+    check_mode,
     check_number,
     check_path,
     check_path_list,
     check_placeholder,
+    check_project,
+    check_public_key,
+    check_registry,
     check_string,
     check_table,
     check_unknown_keys,
     check_whole_number,
+    check_witness,
     key_path,
     load_config,
     read_toml,
@@ -673,22 +683,33 @@ class TestCheckPathList:
 
 
 class TestCheckPlaceholder:
-    def test_real_text_passes(self) -> None:
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param("https://rekor.example", id="url"),
+            pytest.param("PBO < 0.5 per Bailey et al. (2017)", id="less_than"),
+            pytest.param("x > y", id="greater_than"),
+            pytest.param("<cited source>", id="angle_brackets"),
+            pytest.param("todo(bgl) lower case", id="lower_case_marker"),
+        ],
+    )
+    def test_real_text_passes(self, value: str) -> None:
         found = new_collector()
-        assert check_placeholder(
-            found, "https://rekor.example", "project.witness.rekor_url"
-        )
+        assert check_placeholder(found, value, "studies.alpha.gate.basis.costs.text")
         assert not found.has_errors()
 
     @pytest.mark.parametrize(
         "value",
         [
-            pytest.param("ed25519:<public key printed by bgl join>", id="template_key"),
-            pytest.param("<cited source>", id="template_basis"),
-            pytest.param("x > y", id="greater_than"),
+            pytest.param(
+                "ed25519:TODO(bgl): paste the public key printed by bgl join",
+                id="template_key",
+            ),
+            pytest.param("TODO(bgl)", id="marker_only"),
+            pytest.param("Bailey (2014) TODO(bgl) add section", id="half_edited"),
         ],
     )
-    def test_angle_brackets_are_c20(self, value: str) -> None:
+    def test_marker_is_c20(self, value: str) -> None:
         found = new_collector()
         assert not check_placeholder(
             found, value, "studies.alpha.gate.basis.costs.text"
@@ -698,3 +719,470 @@ class TestCheckPlaceholder:
             "studies.alpha.gate.basis.costs.text",
             value,
         )
+
+
+# --- Project table, registry and witness (block 6) ---
+
+
+def key_text(seed: int) -> str:
+    """A valid key text whose 32 bytes start at seed, so each seed is distinct."""
+    raw = bytes((seed + index) % 256 for index in range(32))
+    return "ed25519:" + base64.b64encode(raw).decode("ascii")
+
+
+KEY_TEXT = key_text(0)
+TEMPLATE_KEY = "ed25519:TODO(bgl): paste the public key printed by bgl join"
+
+
+def valid_project(**changes: Any) -> dict[str, Any]:
+    """A valid team [project] table as tomllib returns it, with changes applied."""
+    project: dict[str, Any] = {
+        "name": "example_project",
+        "mode": "team",
+        "ledger": "bgl/ledger",
+        "runs_dir": "bgl/runs",
+        "chains": {
+            "CG1": {"person": "researcher_a", "key": KEY_TEXT},
+            "HC1": {"person": "custodian_a", "key": key_text(1)},
+        },
+        "witness": {
+            "rekor_url": "https://rekor.example",
+            "ots_calendars": ["https://a.example", "https://b.example"],
+        },
+    }
+    project.update(changes)
+    return project
+
+
+def rules_and_keys(found: ErrorCollector) -> list[tuple[str, str | None]]:
+    return [(error.rule, error.key) for error in found.errors]
+
+
+class TestCheckProject:
+    def test_valid_team_project_builds(self) -> None:
+        found = new_collector()
+        parts = check_project(found, {"project": valid_project()})
+        assert not found.has_errors()
+        project = parts.build()
+        assert project is not None
+        assert project.name == "example_project"
+        assert project.mode == "team"
+        assert project.ledger == "bgl/ledger"
+        assert project.runs_dir == "bgl/runs"
+        assert set(project.writers) == {"CG1", "HC1"}
+        assert project.witness is not None
+        assert project.witness.ots_calendars == (
+            "https://a.example",
+            "https://b.example",
+        )
+
+    def test_valid_solo_without_witness_builds(self) -> None:
+        found = new_collector()
+        parts = check_project(
+            found, {"project": valid_project(mode="solo", witness=False)}
+        )
+        assert not found.has_errors()
+        project = parts.build()
+        assert project is not None
+        assert project.witness is None
+
+    def test_missing_project_is_c1_and_nothing_else(self) -> None:
+        found = new_collector()
+        parts = check_project(found, {})
+        assert only_error(found) == ("C1", "project", None)
+        assert parts.build() is None
+
+    def test_unknown_key_is_c7(self) -> None:
+        found = new_collector()
+        check_project(found, {"project": valid_project(ledgr="bgl/ledger")})
+        assert rules_and_keys(found) == [("C7", "project.ledgr")]
+
+    @pytest.mark.parametrize(
+        ("change", "rule", "key"),
+        [
+            pytest.param({"name": ""}, "C1", "project.name", id="empty_name"),
+            pytest.param({"name": 3}, "C1", "project.name", id="name_not_string"),
+            pytest.param({"ledger": "/abs"}, "C2", "project.ledger", id="abs_ledger"),
+            pytest.param(
+                {"runs_dir": "../out"}, "C2", "project.runs_dir", id="runs_dir_escapes"
+            ),
+            pytest.param({"mode": "Team"}, "C14", "project.mode", id="mode_case"),
+        ],
+    )
+    def test_one_bad_field(self, change: dict[str, Any], rule: str, key: str) -> None:
+        found = new_collector()
+        parts = check_project(found, {"project": valid_project(**change)})
+        assert rules_and_keys(found) == [(rule, key)]
+        assert parts.build() is None
+
+    @pytest.mark.parametrize(
+        "key", ["name", "mode", "ledger", "runs_dir", "chains", "witness"]
+    )
+    def test_every_key_is_required(self, key: str) -> None:
+        project = valid_project()
+        del project[key]
+        found = new_collector()
+        parts = check_project(found, {"project": project})
+        assert [k for _, k in rules_and_keys(found)] == [f"project.{key}"]
+        assert parts.build() is None
+
+    def test_bad_name_keeps_mode_and_writers_for_study_checks(self) -> None:
+        found = new_collector()
+        parts = check_project(found, {"project": valid_project(name="")})
+        assert parts.mode == "team"
+        assert parts.writers is not None
+        assert parts.build() is None
+
+    def test_errors_follow_key_order(self) -> None:
+        found = new_collector()
+        check_project(
+            found,
+            {"project": valid_project(name="", mode="x", ledger="", chains={})},
+        )
+        assert [k for _, k in rules_and_keys(found)] == [
+            "project.name",
+            "project.mode",
+            "project.ledger",
+            "project.chains",
+        ]
+
+
+class TestCheckMode:
+    @pytest.mark.parametrize("value", ["solo", "team"])
+    def test_valid(self, value: str) -> None:
+        found = new_collector()
+        assert check_mode(found, {"mode": value}) == value
+        assert not found.has_errors()
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param("Solo", id="capitalised"),
+            pytest.param("solo ", id="trailing_space"),
+            pytest.param("", id="empty"),
+            pytest.param(True, id="bool"),
+            pytest.param(None, id="missing"),
+        ],
+    )
+    def test_invalid_is_c14(self, value: Any) -> None:
+        found = new_collector()
+        table = {} if value is None else {"mode": value}
+        assert check_mode(found, table) is None
+        assert only_error(found) == ("C14", "project.mode", value)
+
+
+class TestCheckRegistry:
+    def test_returns_read_only_writers(self) -> None:
+        found = new_collector()
+        writers = check_registry(found, valid_project())
+        assert writers is not None
+        assert isinstance(writers, types.MappingProxyType)
+        assert writers["CG1"].person == "researcher_a"
+        assert writers["CG1"].public_key == bytes(range(32))
+        with pytest.raises(TypeError):
+            writers["XX1"] = writers["CG1"]  # type: ignore[index]
+
+    def test_missing_chains_is_c12(self) -> None:
+        found = new_collector()
+        project = valid_project()
+        del project["chains"]
+        assert check_registry(found, project) is None
+        assert only_error(found) == ("C12", "project.chains", None)
+
+    def test_empty_registry_is_c12(self) -> None:
+        found = new_collector()
+        assert check_registry(found, valid_project(chains={})) is None
+        assert only_error(found) == ("C12", "project.chains", {})
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param("AB", id="two_chars"),
+            pytest.param("ABCDEF", id="six_chars"),
+            pytest.param("A1", id="letter_then_digit"),
+            pytest.param("CG1", id="example"),
+        ],
+    )
+    def test_valid_code(self, code: str) -> None:
+        found = new_collector()
+        chains = {code: {"person": "p", "key": KEY_TEXT}}
+        assert check_registry(found, valid_project(chains=chains)) is not None
+        assert not found.has_errors()
+
+    @pytest.mark.parametrize(
+        "code",
+        [
+            pytest.param("A", id="one_char"),
+            pytest.param("ABCDEFG", id="seven_chars"),
+            pytest.param("1AB", id="starts_with_digit"),
+            pytest.param("cg1", id="lower_case"),
+            pytest.param("C-1", id="hyphen"),
+            pytest.param("CG1\n", id="trailing_newline"),
+        ],
+    )
+    def test_bad_code_is_c12(self, code: str) -> None:
+        found = new_collector()
+        chains = {code: {"person": "p", "key": KEY_TEXT}}
+        assert check_registry(found, valid_project(chains=chains)) is None
+        assert only_error(found) == ("C12", f"project.chains.{code}", code)
+
+    def test_entry_not_a_table(self) -> None:
+        found = new_collector()
+        assert check_registry(found, valid_project(chains={"CG1": "x"})) is None
+        assert only_error(found) == ("C12", "project.chains.CG1", "x")
+
+    def test_entry_problems_all_reported(self) -> None:
+        found = new_collector()
+        chains = {"CG1": {"person": "", "key": "rsa:abc", "email": "a@b"}}
+        assert check_registry(found, valid_project(chains=chains)) is None
+        assert rules_and_keys(found) == [
+            ("C7", "project.chains.CG1.email"),
+            ("C12", "project.chains.CG1.person"),
+            ("C12", "project.chains.CG1.key"),
+        ]
+
+    def test_one_bad_writer_does_not_hide_another(self) -> None:
+        found = new_collector()
+        chains = {
+            "CG1": {"person": "", "key": KEY_TEXT},
+            "HC1": {"person": "q", "key": "nope"},
+        }
+        assert check_registry(found, valid_project(chains=chains)) is None
+        assert rules_and_keys(found) == [
+            ("C12", "project.chains.CG1.person"),
+            ("C12", "project.chains.HC1.key"),
+        ]
+
+    def test_same_key_twice_is_c12_at_the_later_entry(self) -> None:
+        found = new_collector()
+        chains = {
+            "CG1": {"person": "researcher_a", "key": KEY_TEXT},
+            "CG2": {"person": "researcher_b", "key": key_text(1)},
+            "HC1": {"person": "custodian_a", "key": KEY_TEXT},
+        }
+        assert check_registry(found, valid_project(chains=chains)) is None
+        assert only_error(found) == ("C12", "project.chains.HC1.key", KEY_TEXT)
+
+    def test_template_keys_are_not_compared(self) -> None:
+        found = new_collector()
+        chains = {
+            "CG1": {"person": "researcher_a", "key": TEMPLATE_KEY},
+            "CG2": {"person": "researcher_b", "key": TEMPLATE_KEY},
+        }
+        assert check_registry(found, valid_project(chains=chains)) is None
+        assert rules_and_keys(found) == [
+            ("C20", "project.chains.CG1.key"),
+            ("C20", "project.chains.CG2.key"),
+        ]
+
+    def test_one_person_may_have_two_chains(self) -> None:
+        found = new_collector()
+        chains = {
+            "CG1": {"person": "researcher_a", "key": KEY_TEXT},
+            "CG2": {"person": "researcher_a", "key": key_text(1)},
+        }
+        assert check_registry(found, valid_project(chains=chains)) is not None
+        assert not found.has_errors()
+
+
+class TestCheckPublicKey:
+    PATH = "project.chains.CG1"
+
+    def test_valid_key_returns_raw_bytes(self) -> None:
+        found = new_collector()
+        assert check_public_key(found, {"key": KEY_TEXT}, self.PATH) == bytes(range(32))
+        assert not found.has_errors()
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param(None, id="missing"),
+            pytest.param(5, id="not_string"),
+            pytest.param("", id="empty"),
+            pytest.param(KEY_TEXT.replace("ed25519:", "ED25519:"), id="prefix_case"),
+            pytest.param(KEY_TEXT.replace("ed25519:", ""), id="no_prefix"),
+            pytest.param(
+                "ed25519:" + base64.b64encode(bytes(31)).decode(), id="31_bytes"
+            ),
+            pytest.param(
+                "ed25519:" + base64.b64encode(bytes(33)).decode(), id="33_bytes"
+            ),
+            pytest.param(KEY_TEXT.rstrip("="), id="missing_padding"),
+            pytest.param(KEY_TEXT + " ", id="trailing_space"),
+            pytest.param(
+                "ed25519:" + base64.urlsafe_b64encode(bytes([251] * 32)).decode(),
+                id="url_safe_alphabet",
+            ),
+            pytest.param("ed25519:" + "A" * 42 + "B=", id="non_canonical_bits"),
+        ],
+    )
+    def test_bad_key_is_c12(self, value: Any) -> None:
+        found = new_collector()
+        entry = {} if value is None else {"key": value}
+        assert check_public_key(found, entry, self.PATH) is None
+        assert only_error(found) == ("C12", f"{self.PATH}.key", value)
+
+    def test_template_key_is_c20_only(self) -> None:
+        found = new_collector()
+        assert check_public_key(found, {"key": TEMPLATE_KEY}, self.PATH) is None
+        assert only_error(found) == ("C20", f"{self.PATH}.key", TEMPLATE_KEY)
+
+
+class TestCheckWitness:
+    def witness(self, **changes: Any) -> dict[str, Any]:
+        table: dict[str, Any] = {
+            "rekor_url": "https://rekor.example",
+            "ots_calendars": ["https://a.example"],
+        }
+        table.update(changes)
+        return table
+
+    @pytest.mark.parametrize("mode", ["solo", "team"])
+    def test_table_is_valid_in_either_mode(self, mode: Mode) -> None:
+        found = new_collector()
+        valid, witness = check_witness(found, {"witness": self.witness()}, mode)
+        assert valid
+        assert witness is not None
+        assert witness.rekor_url == "https://rekor.example"
+        assert not found.has_errors()
+
+    def test_false_is_valid_in_solo(self) -> None:
+        found = new_collector()
+        assert check_witness(found, {"witness": False}, "solo") == (True, None)
+        assert not found.has_errors()
+
+    def test_false_is_c17_in_team(self) -> None:
+        found = new_collector()
+        assert check_witness(found, {"witness": False}, "team") == (False, None)
+        assert only_error(found) == ("C17", "project.witness", False)
+
+    def test_false_with_bad_mode_adds_nothing(self) -> None:
+        found = new_collector()
+        assert check_witness(found, {"witness": False}, None) == (False, None)
+        assert not found.has_errors()
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param(None, id="missing"),
+            pytest.param(True, id="true"),
+            pytest.param("on", id="string"),
+        ],
+    )
+    def test_not_a_table_or_false_is_c17(self, value: Any) -> None:
+        found = new_collector()
+        project = {} if value is None else {"witness": value}
+        assert check_witness(found, project, "solo") == (False, None)
+        assert only_error(found) == ("C17", "project.witness", value)
+
+    def test_unknown_key_is_c7(self) -> None:
+        found = new_collector()
+        table = self.witness(rekor="https://x.example")
+        valid, _ = check_witness(found, {"witness": table}, "team")
+        assert valid
+        assert rules_and_keys(found) == [("C7", "project.witness.rekor")]
+
+    def test_both_bad_fields_reported(self) -> None:
+        found = new_collector()
+        table = self.witness(rekor_url="http://rekor.example", ots_calendars=[])
+        assert check_witness(found, {"witness": table}, "team") == (False, None)
+        assert rules_and_keys(found) == [
+            ("C17", "project.witness.rekor_url"),
+            ("C17", "project.witness.ots_calendars"),
+        ]
+
+
+class TestCheckHttpsUrl:
+    PATH = "project.witness"
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param("https://rekor.example", id="plain"),
+            pytest.param("https://rekor.example:8443/api", id="port_and_path"),
+            pytest.param("HTTPS://rekor.example", id="upper_case_scheme"),
+            pytest.param("https://a.example/x>y", id="angle_bracket_allowed"),
+        ],
+    )
+    def test_valid(self, value: str) -> None:
+        found = new_collector()
+        assert (
+            check_https_url(found, {"rekor_url": value}, "rekor_url", self.PATH, "C17")
+            == value
+        )
+        assert not found.has_errors()
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param(None, id="missing"),
+            pytest.param("", id="empty"),
+            pytest.param(7, id="not_string"),
+            pytest.param("http://rekor.example", id="http"),
+            pytest.param("rekor.example", id="no_scheme"),
+            pytest.param("https://", id="no_host"),
+            pytest.param("https://rekor.example:99999", id="bad_port"),
+            pytest.param("https://rekor .example", id="space"),
+            pytest.param("https://rekor.example\n", id="newline"),
+            pytest.param("https://[::1", id="bad_ipv6"),
+        ],
+    )
+    def test_invalid_is_rule(self, value: Any) -> None:
+        found = new_collector()
+        table = {} if value is None else {"rekor_url": value}
+        assert check_https_url(found, table, "rekor_url", self.PATH, "C17") is None
+        assert only_error(found) == ("C17", f"{self.PATH}.rekor_url", value)
+
+    def test_placeholder_is_c20_only(self) -> None:
+        found = new_collector()
+        value = "https://TODO(bgl).example"
+        table = {"rekor_url": value}
+        assert check_https_url(found, table, "rekor_url", self.PATH, "C17") is None
+        assert only_error(found) == ("C20", f"{self.PATH}.rekor_url", value)
+
+
+class TestCheckHttpsUrlList:
+    PATH = "project.witness"
+
+    def test_valid_list_becomes_tuple(self) -> None:
+        found = new_collector()
+        table = {"ots_calendars": ["https://a.example", "https://b.example"]}
+        assert check_https_url_list(
+            found, table, "ots_calendars", self.PATH, "C17"
+        ) == ("https://a.example", "https://b.example")
+        assert not found.has_errors()
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param(None, id="missing"),
+            pytest.param([], id="empty"),
+            pytest.param("https://a.example", id="string_not_list"),
+        ],
+    )
+    def test_bad_shape_is_rule(self, value: Any) -> None:
+        found = new_collector()
+        table = {} if value is None else {"ots_calendars": value}
+        assert (
+            check_https_url_list(found, table, "ots_calendars", self.PATH, "C17")
+            is None
+        )
+        assert only_error(found) == ("C17", f"{self.PATH}.ots_calendars", value)
+
+    def test_each_bad_item_reported_at_its_index(self) -> None:
+        found = new_collector()
+        table = {
+            "ots_calendars": [
+                "https://a.example",
+                "http://b.example",
+                "https://TODO(bgl)",
+            ]
+        }
+        assert (
+            check_https_url_list(found, table, "ots_calendars", self.PATH, "C17")
+            is None
+        )
+        assert rules_and_keys(found) == [
+            ("C17", f"{self.PATH}.ots_calendars[1]"),
+            ("C20", f"{self.PATH}.ots_calendars[2]"),
+        ]
