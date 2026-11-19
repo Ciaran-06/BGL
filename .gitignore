@@ -35,3 +35,7 @@ desktop.ini
 # `bgl init` adds this line, and the other lines a project needs, to every
 # project that uses BGL.
 .bgl/
+
+# --- keep larp status hidden
+CLAUDE.md
+.claude/

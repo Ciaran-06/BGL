@@ -11,7 +11,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any, Final
 
-from bgl import git
+from bgl import git, witness
 from bgl.config import (
     Project,
     Study,
@@ -234,6 +234,8 @@ def amend_study(
             "started": utc_now(),
             **base_fields(identity),
         }
-        return append_row_unlocked(
+        row = append_row_unlocked(
             root, config.project, identity.writer, identity.private_key, fields
         )
+    witness.after_append(root, config.project, identity)
+    return row

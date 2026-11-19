@@ -95,3 +95,18 @@ class Budget:
 
 def budget_of(view: LedgerView, study: str, budget: int) -> Budget:
     return Budget(study=study, budget=budget, used=len(view.counted_opens(study)))
+
+
+def trials_n(view: LedgerView, study: str, prior_trials: int) -> int:
+    """N = prior_trials + the variants of every non-data design run (Trials and N).
+
+    Every open row counts, whatever its status, voided runs included.
+    Confirmatory holdout runs, replay runs, data runs, dry runs, refusals and
+    imported rows are not trials.
+    """
+    variants = sum(
+        row["variants"] or 0
+        for row in view.opens(study)
+        if row["sample"] == "design" and row["type"] != "data"
+    )
+    return prior_trials + variants

@@ -90,3 +90,11 @@ class AmendError(BglError):
 
 class LockError(BglError):
     """The study lock's contents cannot be built, for example a missing spec file."""
+
+
+class SetupError(BglError):
+    """bgl init or bgl join cannot go ahead."""
+
+
+class WitnessError(BglError):
+    """A witness service failed, refused an entry, or returned something invalid."""

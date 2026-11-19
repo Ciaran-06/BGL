@@ -240,3 +240,11 @@ def resolve_commit(root: Path, name: str) -> str | None:
         raise
     except GitError:
         return None
+
+
+def changed_paths(root: Path, folder: str) -> list[str]:
+    """Paths under folder that are new, modified or deleted since the last commit."""
+    output = run_git(
+        root, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", folder
+    )
+    return sorted({record[3:] for record in _split_z(output) if len(record) > 3})

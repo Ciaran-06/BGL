@@ -248,3 +248,70 @@ def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, git_env: None) -> P
     made.use_writer("CG1")
     made.commit("first")
     return made
+
+
+class Services:
+    """Fake Rekor, two calendars and two explorers, reachable at public URLs."""
+
+    REKOR = "https://rekor.example"
+    CALENDARS = ("https://cal-a.example", "https://cal-b.example")
+    EXPLORERS = ("https://explorer-a.example/api", "https://explorer-b.example/api")
+
+    def __init__(self) -> None:
+        from fakes import FakeCalendar, FakeExplorer, FakeRekor
+
+        self.rekor = FakeRekor()
+        self.calendars = [FakeCalendar(url) for url in self.CALENDARS]
+        self.explorers = [FakeExplorer(self.calendars) for _ in self.EXPLORERS]
+        self.routes = {self.REKOR: self.rekor.url}
+        self.routes.update(
+            {
+                url: fake.url
+                for url, fake in zip(self.CALENDARS, self.calendars, strict=True)
+            }
+        )
+        self.routes.update(
+            {
+                url: fake.url
+                for url, fake in zip(self.EXPLORERS, self.explorers, strict=True)
+            }
+        )
+
+    def resolve(self, url: str) -> str:
+        for public, local in self.routes.items():
+            if url == public or url.startswith(public.rstrip("/") + "/"):
+                return local + url[len(public.rstrip("/")) :]
+        raise AssertionError(f"a test tried to reach the network: {url}")
+
+    def confirm_all(self) -> None:
+        for calendar in self.calendars:
+            calendar.confirmed = True
+
+    def stop(self) -> None:
+        for server in [self.rekor, *self.calendars, *self.explorers]:
+            server.stop()
+
+
+WITNESS_TABLE = (
+    '\n[project.witness]\nrekor_url = "https://rekor.example"\n'
+    'ots_calendars = ["https://cal-a.example", "https://cal-b.example"]\n'
+)
+
+
+@pytest.fixture
+def services(monkeypatch: pytest.MonkeyPatch) -> Any:
+    from bgl import netio
+
+    made = Services()
+    monkeypatch.setattr(netio, "resolve", made.resolve)
+    yield made
+    made.stop()
+
+
+@pytest.fixture
+def witnessed(project: Project, services: Services) -> Project:
+    """The project fixture with witnessing on, against the fake services."""
+    project.edit_toml("witness = false\n", WITNESS_TABLE)
+    project.commit("witness on")
+    project.services = services  # type: ignore[attr-defined]
+    return project

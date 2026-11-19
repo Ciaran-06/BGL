@@ -10,7 +10,11 @@ authors = [
 requires-python = ">=3.11"
 dependencies = [
     "cryptography>=50.0.2",
+    "opentimestamps>=0.4.5",
 ]
+
+[project.scripts]
+bgl = "bgl.cli:main"
 
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]
@@ -22,15 +26,22 @@ dev = [
     "hypothesis>=6.170.15",
     "mypy>=2.4.1",
     "pytest>=9.2.0",
+    "pytest-xdist>=3.8.0",
     "ruff>=0.17.5",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-n auto"
 
 [tool.mypy]
 python_version = "3.11"
 strict = true
+
+[[tool.mypy.overrides]]
+# opentimestamps ships without type hints.
+module = ["opentimestamps.*"]
+ignore_missing_imports = true
 
 [tool.ruff]
 target-version = "py311"
@@ -38,3 +49,4 @@ line-length = 88
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
+

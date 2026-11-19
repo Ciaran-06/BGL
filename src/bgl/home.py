@@ -129,3 +129,10 @@ def load_private_key(home: Path, writer: Writer) -> Ed25519PrivateKey:
             "public key in bgl.toml"
         )
     return key
+
+
+def ensure_machine_id(home: Path) -> str:
+    """This machine's ID, creating it on first use (bgl init and bgl join only)."""
+    if (home / _MACHINE_ID_FILE).exists():
+        return load_machine_id(home)
+    return create_machine_id(home)

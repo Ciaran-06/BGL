@@ -19,7 +19,7 @@ _POSITION_IN_MESSAGE = re.compile(
 )
 _UTF8_BOM = b"\xef\xbb\xbf"
 _DRIVE_LETTER = re.compile(r"^[A-Za-z]:")
-_CHAIN_CODE = re.compile(r"[A-Z][A-Z0-9]{1,5}")
+CHAIN_CODE = re.compile(r"[A-Z][A-Z0-9]{1,5}")
 _NAME = re.compile(r"[a-z][a-z0-9_]{0,31}")
 _PREFIX = re.compile(r"[A-Z]{2,4}")
 _KEY_PREFIX = "ed25519:"
@@ -666,7 +666,7 @@ def _check_writer(collector: ErrorCollector, code: str, entry: object) -> Writer
     """One registry entry: its code, then person and key."""
     path = key_path("project.chains", code)
     ok = True
-    if not _CHAIN_CODE.fullmatch(code):
+    if not CHAIN_CODE.fullmatch(code):
         collector.add(
             "C12",
             "a chain code: an uppercase letter, then uppercase letters or digits, "

@@ -74,6 +74,8 @@ CONFIG_FILE: Final[str] = "bgl.toml"
 _LOCKS_DIR: Final[str] = ".bgl/locks"
 _TMP_DIR: Final[str] = ".bgl/tmp"
 CLOSE_FORMAT_VERSION: Final[int] = 1
+# Refusals raised before anything could be signed, so nothing was appended.
+_UNRECORDED: Final[frozenset[str]] = frozenset({"R19", "R7"})
 
 PathLike = str | os.PathLike[str]
 
@@ -348,16 +350,20 @@ class Run:
                 state = self._write_open(
                     root, config, study, request, facts, view, identity, fixtures, stack
                 )
+        except RunRefused as refusal:
+            stack.close()
+            if refusal.rule not in _UNRECORDED:
+                witness.after_append(root, config.project, identity)
+            raise
         except BaseException:
             stack.close()
             raise
+        # R23: after the open (or dry) row and before the run's code. A failure
+        # does not stop the run; the open is then unwitnessed.
+        witness.after_append(root, config.project, identity)
         if request.dry:
             audit.start_watching(state.watch)
             return state
-        # R23: after the open row and before the run's code. A failure does not
-        # stop the run; the open is then unwitnessed.
-        with contextlib.suppress(Exception):
-            witness.submit_head(root, config.project, identity)
         if request.counted:
             output = root / config.project.runs_dir / "output"
             state.capture = OutputCapture(
@@ -726,6 +732,7 @@ class Run:
         finally:
             state.stack.close()  # releases the run lock
             shutil.rmtree(state.root / _TMP_DIR, ignore_errors=True)
+        witness.after_append(state.root, state.config.project, state.identity)
         # [DECISION] A run closed as invalid raises RunInvalid on exit when the
         # body itself raised nothing, so the script cannot carry on unaware.
         if status == "invalid" and exc is None:
