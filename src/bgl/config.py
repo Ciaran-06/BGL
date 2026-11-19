@@ -1,8 +1,9 @@
 import dataclasses
 import datetime
+import math
 import re
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +14,7 @@ _POSITION_IN_MESSAGE = re.compile(
     r"\s*\(at (?:line \d+, column \d+|end of document)\)\s*$"
 )
 _UTF8_BOM = b"\xef\xbb\xbf"
+_DRIVE_LETTER = re.compile(r"^[A-Za-z]:")
 
 
 class ConfigError(Exception):
@@ -56,6 +58,56 @@ class ConfigError(Exception):
         return text
 
 
+class ConfigErrorGroup(ExceptionGroup[ConfigError]):
+    """Every phase 2 error found in one bgl.toml, raised together."""
+
+    file: Path
+
+    def __new__(cls, file: Path, errors: Sequence[ConfigError]) -> "ConfigErrorGroup":
+        for error in errors:
+            if not isinstance(error, ConfigError):
+                name = type(error).__name__
+                raise TypeError(f"ConfigErrorGroup holds ConfigError only, got {name}")
+        count = len(errors)
+        noun = "problem" if count == 1 else "problems"
+        group = super().__new__(cls, f"{file.name} has {count} {noun}", errors)
+        group.file = file
+        return group
+
+    def derive(  # type: ignore[override]
+        self, excs: Sequence[ConfigError]
+    ) -> "ConfigErrorGroup":
+        """Keep the type and file when split() or subgroup() builds a smaller group."""
+        return ConfigErrorGroup(self.file, excs)
+
+
+class ErrorCollector:
+    """Collects phase 2 errors for one file, then raises them together."""
+
+    def __init__(self, file: Path) -> None:
+        self.file = file
+        self.errors: list[ConfigError] = []
+
+    def add(
+        self,
+        rule: str,
+        expected: str,
+        *,
+        key: str | None = None,
+        found: object = None,
+    ) -> None:
+        """Record one error. A found value of None means the key is missing."""
+        self.errors.append(ConfigError(self.file, rule, expected, key=key, found=found))
+
+    def has_errors(self) -> bool:
+        return bool(self.errors)
+
+    def raise_if_any(self) -> None:
+        """Raise every collected error as one ConfigErrorGroup, in the order found."""
+        if self.errors:
+            raise ConfigErrorGroup(self.file, self.errors)
+
+
 def read_toml(file: Path) -> dict[str, Any]:
     """Read and parse bgl.toml. Every failure becomes a ConfigError."""
     if not isinstance(file, Path):
@@ -93,6 +145,221 @@ def read_toml(file: Path) -> dict[str, Any]:
             f"valid TOML ({_error_text(error)})",
             line=_error_line(error),
         ) from error
+
+
+def key_path(table_path: str, key: str) -> str:
+    """The dotted key path of key inside the table at table_path."""
+    return f"{table_path}.{key}" if table_path else key
+
+
+def check_unknown_keys(
+    collector: ErrorCollector,
+    table: Mapping[str, Any],
+    allowed: frozenset[str],
+    table_path: str,
+) -> None:
+    """C7: report every key in table that is not in allowed, in sorted order."""
+    for key in sorted(set(table) - allowed):
+        collector.add(
+            "C7",
+            "only known keys (check the spelling)",
+            key=key_path(table_path, key),
+            found=table[key],
+        )
+
+
+def check_table(
+    collector: ErrorCollector,
+    table: Mapping[str, Any],
+    key: str,
+    table_path: str,
+    rule: str,
+) -> dict[str, Any] | None:
+    """A sub-table that must be present. Returns it, or None after adding an error."""
+    value = table.get(key)
+    if not isinstance(value, dict):
+        collector.add(rule, "a table", key=key_path(table_path, key), found=value)
+        return None
+    return value
+
+
+def check_whole_number(
+    collector: ErrorCollector,
+    table: Mapping[str, Any],
+    key: str,
+    table_path: str,
+    rule: str,
+    *,
+    minimum: int,
+    even: bool = False,
+) -> int | None:
+    """An integer (not a boolean) of at least minimum, and even if asked."""
+    value = table.get(key)
+    if (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value >= minimum
+        and (not even or value % 2 == 0)
+    ):
+        return value
+    expected = f"a whole number, at least {minimum}" + (", and even" if even else "")
+    collector.add(rule, expected, key=key_path(table_path, key), found=value)
+    return None
+
+
+def check_number(
+    collector: ErrorCollector,
+    table: Mapping[str, Any],
+    key: str,
+    table_path: str,
+    rule: str,
+    *,
+    above: float | None = None,
+    at_least: float | None = None,
+    below: float | None = None,
+    at_most: float | None = None,
+) -> float | None:
+    """A finite number (integer or float, not a boolean) within the given bounds.
+
+    Give at most one lower bound (above or at_least) and at most one upper bound
+    (below or at_most). Integers are converted to floats.
+    """
+    value = table.get(key)
+    expected = _describe_range(above, at_least, below, at_most)
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(value)
+    ):
+        collector.add(rule, expected, key=key_path(table_path, key), found=value)
+        return None
+    number = float(value)
+    in_range = (
+        (above is None or number > above)
+        and (at_least is None or number >= at_least)
+        and (below is None or number < below)
+        and (at_most is None or number <= at_most)
+    )
+    if not in_range:
+        collector.add(rule, expected, key=key_path(table_path, key), found=value)
+        return None
+    return number
+
+
+def _describe_range(
+    above: float | None,
+    at_least: float | None,
+    below: float | None,
+    at_most: float | None,
+) -> str:
+    parts = []
+    if above is not None:
+        parts.append(f"above {above:g}")
+    if at_least is not None:
+        parts.append(f"at least {at_least:g}")
+    if below is not None:
+        parts.append(f"below {below:g}")
+    if at_most is not None:
+        parts.append(f"at most {at_most:g}")
+    return "a finite number" + (" " + " and ".join(parts) if parts else "")
+
+
+def check_string(
+    collector: ErrorCollector,
+    table: Mapping[str, Any],
+    key: str,
+    table_path: str,
+    rule: str,
+) -> str | None:
+    """A non-empty string."""
+    value = table.get(key)
+    if not isinstance(value, str) or not value:
+        collector.add(
+            rule, "a non-empty string", key=key_path(table_path, key), found=value
+        )
+        return None
+    return value
+
+
+def check_path(
+    collector: ErrorCollector,
+    table: Mapping[str, Any],
+    key: str,
+    table_path: str,
+) -> str | None:
+    """C2: a relative path with forward slashes that stays inside the repository."""
+    value = table.get(key)
+    problem = _path_problem(value)
+    if problem is None and isinstance(value, str):
+        return value
+    collector.add(
+        "C2",
+        f"a relative path inside the repository ({problem})",
+        key=key_path(table_path, key),
+        found=value,
+    )
+    return None
+
+
+def check_path_list(
+    collector: ErrorCollector,
+    table: Mapping[str, Any],
+    key: str,
+    table_path: str,
+    rule: str,
+    *,
+    allow_empty: bool,
+) -> tuple[str, ...] | None:
+    """A list of C2 paths. The list's own shape is reported under rule."""
+    value = table.get(key)
+    if not isinstance(value, list) or (not value and not allow_empty):
+        expected = "a list of paths" + ("" if allow_empty else ", not empty")
+        collector.add(rule, expected, key=key_path(table_path, key), found=value)
+        return None
+    paths: list[str] = []
+    ok = True
+    for index, item in enumerate(value):
+        problem = _path_problem(item)
+        if problem is None and isinstance(item, str):
+            paths.append(item)
+            continue
+        collector.add(
+            "C2",
+            f"a relative path inside the repository ({problem})",
+            key=f"{key_path(table_path, key)}[{index}]",
+            found=item,
+        )
+        ok = False
+    return tuple(paths) if ok else None
+
+
+def _path_problem(value: object) -> str | None:
+    """Why value is not an acceptable config path, or None if it is."""
+    if not isinstance(value, str) or not value:
+        return "a non-empty string"
+    if "\\" in value:
+        return "forward slashes only"
+    if value.startswith("/") or _DRIVE_LETTER.match(value):
+        return "not absolute"
+    depth = 0
+    for part in value.split("/"):
+        if part == "..":
+            depth -= 1
+            if depth < 0:
+                return "must not leave the repository"
+        elif part not in ("", "."):
+            depth += 1
+    return None
+
+
+def check_placeholder(collector: ErrorCollector, value: str, path: str) -> bool:
+    """C20: refuse template text. Returns True if value is acceptable."""
+    if "<" in value or ">" in value:
+        collector.add(
+            "C20", "real text, not a template placeholder", key=path, found=value
+        )
+        return False
+    return True
 
 
 def _error_text(error: tomllib.TOMLDecodeError) -> str:
