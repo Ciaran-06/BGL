@@ -1,8 +1,90 @@
-# Backtest governance library: design spec (v0.1 revised)
+# Backtest governance library: design spec (v0.1, full library)
 
 Nov 18, 2026 · @ciaran gaffney
 
-## Revision log (18 Nov 2026)
+## Revision log
+
+### Independent review and decision batch (18 Nov 2026)
+
+An independent review found 8 critical and 16 major problems. Most had one root: the spec called rules "enforced" when BGL is only told the facts behind them. Every rule now carries a class (see Rule classes), and the decisions below close the findings.
+
+| # | Decision | Where it lands |
+| --- | --- | --- |
+| 1 | The first counted open of a study locks the whole study table and the writer registry automatically, values included. Changes after that are typed amendments, each of which can only weaken the evidence on paper | Study lock and amendments; R22; C19 |
+| 2 | One chain per writer (one person on one machine), with a local writer file and a signing key | Writers, chains and keys; R19; C12 |
+| 3 | Holdout data lives in declared files. A holdout custodian seals them and runs the one holdout test. Outputs derived from holdout data are tracked by hash and refused as design inputs | Holdout, custodian and sealing; R20; C11, C15 |
+| 4 | Each study declares its PBO bar with a basis, capped at 0.5 | G8; C10 |
+| 5 | BGL applies the locked cost model itself, from each variant's gross returns and turnover | Statistics; G10; `run.returns` |
+| 6 | Stage 4 is a replay check. The bootstrap band is reported but does not decide | G12, G13 |
+| 7 | `periods_per_year` is required and locked per study. Return series may carry timestamps. Each study declares its return basis. Studies without a gate table are allowed | C16; Return series file |
+| 8 | Every gate value carries a basis (a citation or written reasoning). BGL's own placeholder text is rejected | C10, C20 |
+| 9 | Each run declares how many variants it evaluated. N is the sum of those counts plus `prior_trials`. Counted runs store every variant's series | Trials and N; R21 |
+| 10 | Open rows record the other chains' heads. The gate recomputes every per-study rule over all chains | R24; G5 |
+| 11 | Correction rows go in the writer's own chain. A late close is derived, never written | R10, R14 |
+| 12 | Witnessing (a protected remote branch plus OpenTimestamps) is automated from v0.1 | Witness; R23; G2 |
+| 13 | One holdout look per study, and one confirmatory run may decide several claims. A void depends on what the run exposed, not on its status | R6, R20, G4 |
+| 14 | Imported rows are display-only for N and budget, but binding for claims and the holdout | `migrate` |
+| 15 | A gate table added after the lock is never deployment-grade | G1 |
+| 16 | Dry runs run the script on fixtures, block every other read by default, and leave a `dry` row | R25 |
+| 17 | The gate deflates the selected design variant and tests the holdout run against zero. V is floored at the null variance (BGL's choice). N = 1 gives a hurdle of zero. Missing series are reported, and N keeps the penalty | Statistics |
+| 18 | MinTRL report-only; R17 by module scan; torn-tail repair; orphan IDs never reused; duplicates judged on recorded facts; `counts` derived from `type`; declared claim outcomes; rule classes | R4, R14, R16, R17; Statistics |
+| A | A small set of pinned dependencies (`cryptography`, `opentimestamps`, `numpy`), and Ed25519 signatures on ledger rows | Packaging; R15 |
+| B | Solo projects may run without a custodian. Team projects must declare one. Deployment-grade requires one | C14, C15; G2 |
+| C | The whole library is v0.1; the GUI is v0.2 | Roadmap |
+| D | Estimators: BGL subtracts a locked risk-free series; standard deviation over $T-1$; population moments with kurtosis not excess; Lo (2002) adjustment reported only | Statistics |
+| E | DSR and PBO are cross-checked against fixed test vectors, not an outside package | Testing |
+
+**Added by me to make the decisions fit together. Check these before building:**
+
+- (a) Deployment-grade also requires a holdout. A study with `holdout = false` can run the gate, but is labelled not deployment-grade. *Reason:* the custodian exists to guard the holdout.
+- (b) A `replay` run type and a `live` sample, for stage 4.
+- (c) If PBO cannot be computed (too few trials, or too few periods for 4 blocks), stage 2 fails. *Reason:* a check that only fails cannot show the absence of overfitting if it never runs.
+- (d) The holdout run's PSR against zero gets its own threshold key, `psr_threshold`.
+- (e) `spec_files`: research design documents are hashed into the study lock. This replaces the old v0.3 rule that a confirmatory run needs a registration. OSF publication stays optional (`register`).
+- (f) Witness status is worked out from the remote branch and the stamps. The writer never records it.
+- (g) Each `live_return` row must be witnessed within a declared lag of its period (`live_witness_lag_days`).
+- (h) Witness branches are named `bgl-witness/<CODE>` and pushed with git plumbing commands, so the working branch is never touched.
+- (i) Private keys and the machine ID live in the user's home config folder, so `git clean -x` cannot delete them.
+- (j) Refused rows, dry rows and imported rows get IDs with the letters F, T and I. An imported row keeps its original ID in `legacy_id`.
+- (k) The bootstrap band uses a fixed number of replications and a seed taken from the lock hash, so it needs no config keys.
+- (l) `capital`, `participation_limit` and `mintrl_confidence` leave the gate table. Capacity moves to the reviewer checklist.
+- (m) Output is captured for every counted run, not just holdout runs.
+- (n) Confirmatory holdout runs and replay runs are not trials.
+- (o) R4 applies to counted runs only, so an exact rerun is possible as an exploratory run.
+- (p) Holdout keys, frequency, return basis, risk-free series, mode and witness settings can never be amended. The custodian can be handed over (see Study lock and amendments). *Reason:* a custodian is often a role that changes hands every year, and under "never" a study whose custodian leaves would be dead.
+
+**Signed off 18 Nov 2026:** items (a) to (p), with (p) as written above.
+
+**Numbering.** R1 to R18 and R3b keep their numbers. New rules are R19 to R25. Gate rules are renumbered G1 to G14; nothing depended on the old numbers.
+
+### Stage 4 and witness redesign (18 Nov 2026, evening)
+
+| # | Decision | Where it lands |
+| --- | --- | --- |
+| W1 | Stage 4's verdict is a position-hash replay (exact match, no tolerance) plus an implementation-shortfall cost check. The bootstrap band stays, reported only. `replay_tolerance` is removed | G11 to G14; C10; `live_return` rows; Python API |
+| W2 | Witnessing uses a public transparency log (Sigstore Rekor) to detect discarded runs, and OpenTimestamps for timing. The `bgl-witness/<CODE>` branches and the branch-protection checklist item are removed | Witness; R23; G2; C17 |
+
+*Reason for W1:* a return replay needs a tolerance wide enough to absorb fill noise, and a small bug can hide inside it. Positions computed from the same recorded inputs must match exactly, so any difference between the live system and the backtested code fails. The cost check tests the one assumption stage 3 cannot: whether the cost model holds in live trading.
+
+*Reason for W2:* BGL cannot read a git host's branch-protection settings, so a protected branch was only ever a checklist item. Rekor entries can be listed by the writer's public key, so a reviewer can check that every head a writer ever submitted is still in the chain. A discarded run then shows up as a missing head, and BGL checks this itself.
+
+**Added by me; check these:**
+
+- (q) The position-hash rounding (8 decimal places) and the canonical position text are fixed by `format_version`, not by a config key.
+- (r) The live cost check passes when realised costs over the incubation are at most twice the modelled costs: the same factor G10 already showed the strategy survives.
+- (s) No new dependency for Rekor: BGL calls its HTTP API with the standard library, and verifies proofs with `hashlib` and `cryptography`.
+- Items (f) and (h) in the batch above are superseded by W2 wherever they mention witness branches.
+
+### Config numbers and the empty file (18 Nov 2026, late)
+
+| # | Decision | Where it lands |
+| --- | --- | --- |
+| N1 | Config decimals are floats, not `Decimal`. Integers are accepted for decimal keys and converted. The lock stores each float's shortest round-trip text as a string | Shared checks; C10; C19; Study lock |
+| N2 | C1 also requires a `[project]` table and a `[studies]` table, which may be empty. An empty file gives two C1 errors | C1 |
+
+*Reason for N1:* the statistics are floats, so keeping config numbers as floats avoids converting between types, and a harmless reformat (`0.95` to `0.950`) no longer looks like a change to a locked value.
+
+### Earlier revisions (18 Nov 2026; superseded where they conflict with the batch above)
 
 Four changes came out of review. Three more follow from them and are mine, so check those before building.
 
@@ -29,22 +111,32 @@ Added by me to keep the spec consistent:
 
 **Added by me:** a lock file, not the process ID, marks a live run. The standard library cannot read a process's start time portably, and PIDs get reused, so a PID alone can mislead.
 
-The lifecycle and roadmap diagrams from the original doc are not in this version. The original stays the design record until they are redrawn.
-
 **Step 2 (18 Nov 2026):** config rules C1 to C9 added. C6 and C7 were added by me, not from review.
+
+**Config decisions (18 Nov 2026):** no config key has a default. Every study declares `holdout_start` or `holdout = false`, and `prior_trials` (new C13). The cost model moves from each run to the study's `[gate.costs]` table and is locked with the thresholds. `cscv_blocks` is at least 4 and even. Errors carry a rule ID, which tests match on. One shared whole-number check covers every count field. The run-ID chain code is confirmed. Timestamp verification may use any independent source of Bitcoin block data.
+
+**Generalised (18 Nov 2026):** BGL no longer names or depends on any user project. Examples use a made-up project (`example_project`, studies `alpha` and `beta`). Release gates run against a new example project in `examples/`, which uses only synthetic data from a fixed seed. `migrate` reads a documented BGL import format, keeps each row's declared study, and refuses any import that would change one. Dogfooding feeds back one way only, as general issues with example-project tests. Adopting BGL is each project's own task, not a BGL build step.
 
 **Batch decisions (18 Nov 2026):** every open decision in the table is now decided. Rules are stated in general terms, and study names appear only in examples.
 
-**Gate (18 Nov 2026):** a deployment gate added to v0.2 as `bgl gate STUDY`, with four stages and rules G1 to G12. Decided the same day: stage 1 has two pass levels, ledger-ordered and externally anchored, with a hand-made OpenTimestamps anchor until v0.3. The threshold lock stays at the first counted run. A late lock is logged as a deviation. Changes after the lock are refused in place; errors can be amended by deviation, and the original verdict always stands beside any amended result. The verdict is the first failing stage. Stages 2 and 3 both run and are reported, and a stage that runs after an earlier failure is labelled diagnostic. A voided holdout run counts as an opening unless its manifest proves it exposed nothing. Return series are stored as one portfolio-level daily series per counted run, in a git-ignored folder, with only the hash in the ledger. Prior trials are excluded from PBO, which states the limit, with DSR covering them. It stays inside BGL rather than becoming a separate library, because the ledger already holds the honest trial count that the gate needs. Config rules C10 and C11 added for thresholds and the holdout. The fields the statistics need are added to v0.1 now, marked *v0.1 schema change*, while no format is released. Open decisions added where the spec cannot decide alone.
+**Gate (18 Nov 2026):** a deployment gate added as `bgl gate STUDY`, with four stages. Stage 1 has two pass levels. The threshold lock stays at the first counted run. Changes after the lock are refused in place; errors can be amended by deviation, and the original verdict always stands beside any amended result. The verdict is the first failing stage. Return series are stored as one series per counted run, in a git-ignored folder, with only the hash in the ledger. Prior trials are excluded from PBO, with DSR covering them.
 
 ## Purpose and users
 
-BGL (Backtest Governance Library) is a Python library that makes every backtest run in a QuantSoc project **logged, budgeted, reproducible and tamper-evident**. Each run writes its prediction before it starts, and its result after it ends. Later versions correct reported results for the number of trials and register specs with an external timestamp.
+BGL (Backtest Governance Library) is a Python library that applies the research discipline a fund imposes on an alpha researcher to every backtest run in a project. Each run is:
 
-- **Primary users:** QuantSoc members running research projects in Python, from first-years to experienced researchers.
-- **Secondary users:** reviewers (team leads, the fund's decision makers) who check a project's claims before money is committed.
-- **First user:** the regime\_consensus project, which replaces its own `runlog.py` with this library.
-- **What a user gets:** one shared standard of evidence across the society, so a strategy's track record can be trusted by someone who did not watch it being built.
+- logged with its prediction before it starts and its result after it ends;
+- counted against a budget;
+- signed by the person and machine that ran it;
+- witnessed outside the researcher's control.
+
+A deployment gate then corrects the reported result for the number of variants tried, and tests it on a holdout the researcher cannot open alone.
+
+- **Researchers:** individuals or teams running research in Python.
+- **Reviewers:** people who check a study's claims before money is committed.
+- **Holdout custodian:** a person who is not one of the study's researchers. The custodian holds the holdout data and runs the one holdout test. Team projects must have one; solo projects may.
+- **First adopters:** real research projects use BGL before each release. They test it; they do not shape it. Problems they find come back as general issues (see Example project and dogfooding).
+- **What a user gets:** a record of a strategy's research that someone who did not watch it being built can check.
 
 ## The problem
 
@@ -53,433 +145,908 @@ Existing experiment trackers record what happened. None that we know of enforces
 | Need | MLflow, Weights & Biases | DVC | This library |
 | --- | --- | --- | --- |
 | Logs parameters and results | Yes | Partly | Yes |
-| Ties each run to exact committed code | Optional | Yes | Required: refuses uncommitted changes |
-| Prediction written before the run | No | No | Required |
-| Run budget per study | No | No | Enforced |
+| Ties each run to committed code | Optional | Yes | Required: refuses uncommitted changes to tracked code |
+| Prediction written before the run | No | No | Required, and witnessed |
+| Run budget per study | No | No | Enforced per writer; recounted across writers at the gate |
 | Refuses accidental duplicate runs | No | No | Yes |
-| Logs crashed runs | Partly | No | Always |
-| Detects edited or deleted log rows | No | No | Hash chain |
-| Corrects results for the number of trials | No | No | v0.2 |
-| External proof of when a spec was fixed | No | No | v0.3 |
+| Logs crashed runs | Partly | No | Yes; a hard-killed run is reported as unclosed |
+| Detects edited or deleted log rows | No | No | Hash chain and signatures. A deleted, discarded or rebuilt chain is detected through the public transparency log |
+| Corrects results for the number of variants tried | No | No | Yes. N is a lower bound, because work outside runs is invisible |
+| Holdout held by someone else | No | No | Holdout custodian |
+| External proof of timing | No | No | OpenTimestamps |
 
 The comparison is from general knowledge of these tools, not a fresh review. Check current features before the README makes this claim.
 
-**Motivating case:** in regime\_consensus, a script that crashed after printing results would have left no log row, and a renamed config list caused a bug that two runs repeated before it was noticed. Both are the kind of problem this library is built to catch.
+**Typical failures:** a script that crashes after printing its results leaves no log row, so the look at the results goes unrecorded. A renamed config setting causes a bug that several runs repeat before anyone notices. Both are the kind of problem this library is built to catch.
 
-## Scope of v0.1 and non-goals
+## Scope and non-goals
 
-v0.1 is the smallest version that regime\_consensus can switch to and that a second QuantSoc project could adopt without changes.
+v0.1 is the whole library: runs, ledger, writers, witness, custodian sealing, statistics, the deployment gate, import, and optional public registration. v0.2 adds the GUI. v0.1 must be adoptable by any Python research project whose analyses are scripts that read files.
 
-**In v0.1**
+**Not in v0.1**
 
-- A run context manager. It checks before the run, writes an `open` row, then writes a `close` row after it, including crashes.
-- An append-only ledger with a hash chain, and a `verify` command.
-- A manifest per run: commit, config, data hashes, environment, prediction, result.
-- Studies with separate budgets, set in one project config file.
-- A command-line tool: `init`, `status`, `list`, `show`, `verify`, `note`, `abandon`, `migrate`.
-- Full test coverage of every rule the library enforces.
-- The fields that v0.2's statistics and gate need: the sample a run uses, its data dates, and the return-series reference. They are added now so no migration is needed (marked *v0.1 schema change* in File formats).
-
-**Not in v0.1 (later versions)**
-
-- Deflated Sharpe, trial counting and the deployment gate (v0.2), external registration (v0.3), a GUI (v0.4).
+- The GUI (v0.2).
+- Capacity analysis. It needs per-asset volume, which BGL never stores, so it is on the reviewer checklist.
+- Cost models other than flat. A spread estimator needs per-asset prices.
+- Array jobs spread across cluster nodes. Each node would be a separate writer, and locks are unreliable on shared network storage.
+- Notebooks and database inputs. A run is a committed script, and only file inputs are hashed.
 
 **Never in scope**
 
-- **Running backtests or computing returns.** The library governs runs; it does not do the research.
-- **Storing data.** It records hashes of input files, never the files, so licensed data (CRSP, IVolatility) never leaves the user's machine. The one exception is each counted run's portfolio-level daily return series, kept in a git-ignored folder (see Return series file). Per-asset returns and raw data are never stored.
-- **Preventing a determined cheat.** A user can always delete the folder. The aim is that honest work is easy to prove and dishonest editing is detectable, not that it is impossible.
-- **Hosting or accounts.** Everything is files in the project's git repository.
+- **Running backtests or computing strategy returns.** The library governs runs; it does not do the research.
+- **Storing data.** BGL records hashes of input files, never the files, so licensed data never leaves the user's machine. There are three exceptions, all git-ignored and never committed:
+  - each counted run's portfolio-level return and turnover series (see Return series file);
+  - each counted run's captured output;
+  - the custodian's sealed holdout files.
+  
+  Per-asset returns and raw data are never stored.
+- **Preventing a determined cheat.** A user can always delete the folder, or modify BGL itself. The aim is that honest work is easy to prove and dishonest editing is detectable, not that it is impossible.
+- **Hosting or accounts.** Witnessing uses two public services that need no account: the Sigstore Rekor transparency log and OpenTimestamps calendars.
 
-**What v0.1 does not prove**
+**What BGL does not prove**
 
-- **When.** Open and close times are self-reported. The chain proves their order, not their date, until v0.3 anchors them externally.
-- **Truncation.** Trailing rows can be deleted without breaking the chain. A partial guard: `bgl status` prints the ledger's head hash. Record it in each commit message or post it to the team channel. A later deletion then shows up as a hash that is missing. If history is rewritten and no hash was posted anywhere, the deletion is invisible. v0.3 closes this properly.
-- **Undeclared reads.** Only files opened through Python are recorded, and some reads (C extensions such as pyarrow) may bypass that. See R8. The same gap limits dry-run enforcement.
-- **Locks on synced or network folders.** Locks are unreliable there, so projects should not sit in them. `init` warns; see File formats.
-- **Other machines.** A live run can only be seen from the machine it runs on. Another machine gets a "cannot tell" from `verify`, never a guess.
+- **Work outside runs.** N counts the variants that runs declare. A loop inside a run that declares fewer variants, analysis above `start_run`, or code run without BGL is all invisible, so N is a lower bound. The reviewer checklist compares each declared variant count with the recorded code.
+- **Declared values.** Variant counts, sample dates, the return basis, turnover, the content of the risk-free file, claim outcomes and prediction content are what the researcher says. Every report labels them as declared.
+- **When, without a witness.** Times in rows are self-reported. A stamped head proves the rows existed by a Bitcoin block's time.
+- **Discards before witnessing.** A run whose open was never witnessed (because it ran offline) could have been thrown away without trace. Such runs are marked unwitnessed, and a study containing one is not deployment-grade.
+- **Anything, if the transparency log is unavailable or dishonest.** BGL relies on the public Rekor instance being available. Its entries carry inclusion proofs, and its history carries consistency proofs, so a log that rewrote its history would be detectable, but a log that refused submissions would leave runs unwitnessed.
+- **Reads outside Python.** Files opened by C extensions such as pyarrow may not be seen (see the audit-hook spike in the build order).
+- **Public data.** Sealing a holdout file does not stop a researcher downloading public data for the holdout period again.
+- **Who has held the raw data.** If the researcher held the full history before the split, sealing proves only that BGL-governed runs did not read the holdout. The gate report says who did the split.
+- **Locks on synced or network folders.** Locks are unreliable there, so projects should not sit in them. `init` warns.
+- **Live runs on other machines.** A live run can only be seen from the machine it runs on. Another machine gets a "cannot tell" from `verify`, never a guess.
 
 *Reason:* a library that certifies other people's honesty has to be exact about what it can and cannot show.
+
+## Rule classes
+
+| Class | Meaning | How it shows |
+| --- | --- | --- |
+| Enforced | BGL refuses or records it itself. Skipping it means changing BGL | A refusal or a recorded status |
+| Detectable | BGL cannot stop it, but `verify` or the gate finds it afterwards | A `verify` failure or a gate finding |
+| Declared | BGL records what it is told and cannot check it | Labelled "declared" in every report |
+
+Every rule below states its class. A rule with parts in different classes says which part is which. *Reason:* the earlier spec called rules "enforced" when BGL was only told the facts behind them.
 
 ## Core concepts
 
 | Term | Meaning |
 | --- | --- |
-| Project | One git repository with a config file at its root. |
-| Study | One test design with its own design period and its own run budget (for example `equities` and `crypto` in regime\_consensus). |
-| Run | One execution of an analysis script. Every run is recorded, whether it succeeds, fails or crashes. |
-| Run type | `data` (checks on data, no results), `exploratory`, `diagnostic` or `confirmatory`. Only diagnostic and confirmatory runs count towards the budget. A confirmatory run is the one that decides a claim. |
-| Open row | The first ledger row of a run, written before the analysis starts. It holds the prediction, inputs, commit, the host, and the lock that marks the run as live. It uses budget. |
-| Close row | The second ledger row of a run, written when it ends. It holds the status, result and close file. |
-| Status | `ok`, `no_result`, `crashed`, `interrupted`, `abandoned` (set by `abandon`), `invalid` (set by R17) or `refused`. |
-| Unclosed run | A run with an open row and no close row, for example after a power cut. `verify` fails it unless its lock is still held on this machine. |
-| Abandon | Closes an unclosed run with a written reason. The only way to clear an unclosed-run failure. |
+| Project | One git repository with `bgl.toml` at its root. Its mode is `solo` or `team` (C14). |
+| Study | One test design: a design period, a holdout, a budget, claims and thresholds. Locked at its first counted open. |
+| Writer | One person on one machine. Each writer has a chain code, a signing key and its own ledger chain. |
+| Person | The label that groups one person's writers in the registry. Used to tell researchers apart from the custodian. |
+| Chain | The append-only file of one writer's rows, hash-chained and signed. |
+| Run | One execution of an analysis script through `start_run`. Every run is recorded, whether it succeeds, fails or crashes. |
+| Run type | `data` prepares or checks data and tests no strategy. `exploratory` looks informally at data or strategies, and may test variants. `diagnostic` is a planned test of one or more strategy variants. `confirmatory` decides one or more claims. `replay` reruns the incubation commit on the recorded live input files during incubation, to recompute each period's positions. |
+| Counted run | A diagnostic or confirmatory run. It uses one unit of budget at open. |
+| Variant | One strategy configuration whose performance a run computed. Each run declares how many it evaluated. |
+| Trial | One variant evaluated on the design sample, in a non-data run of any status (voided runs included), plus each declared prior trial. Confirmatory holdout runs and replay runs are not trials. |
+| N | The number of trials in a study (see Trials and N). |
+| Budget | The maximum number of counted runs a study may open. Budget limits looks; N measures search. |
+| Sample | `design`, `holdout` or `live`. |
+| Holdout | The study's data from `holdout_start` on, kept in declared holdout files. Looked at once, by the confirmatory holdout run. |
+| Restricted file | A raw file holding both design and holdout data. Only data runs before the study lock may read it, to do the split. |
+| Holdout custodian | The person who holds and seals the holdout files, and runs the confirmatory holdout run and the replay runs. Never a researcher on the study. |
+| Study lock | The `lock` row written by a study's first counted open. It holds the canonical study table, the chain registry and the spec-file hashes. |
+| Amendment | An `amend` row changing a locked value within the typed rules. |
+| Open row | The first ledger row of a run, written before the run's code starts. It holds the prediction, inputs, commit and variant count. |
+| Close row | The second ledger row of a run, written when it ends. It holds the status, result and file hashes. |
+| Status | `ok`, `no_result`, `crashed`, `interrupted`, `abandoned`, `invalid` or `refused`. |
+| Unclosed run | A run with an open row and no close row, for example after a power cut. |
+| Abandon | Closes an unclosed run with a written reason. |
+| Late close | Worked out by `verify`, never written: a normal close row for a run that already has an `abandoned` close. |
+| Void | Marks a confirmatory run as a bug, which frees one rerun (R6). |
 | Prediction | What the researcher expects, written into the open row before the run starts. Required for diagnostic and confirmatory runs. |
-| Budget | The maximum number of counted runs a study may open before its frozen test. |
-| Ledger | The append-only log of every run event, one JSON line each, chained by hashes. |
-| Manifest | The file or files holding everything needed to reproduce and audit one run. |
-| Head hash | The hash of the newest ledger row. Printed by `status` so it can be recorded outside the repository. |
-| Claim | A named hypothesis in a study. A confirmatory run names the claim it decides; each claim may have only one. |
-| Holdout | The part of a study's data kept back for the frozen test. A run declares `sample = holdout` to read it. Holdout data starts at the study's `holdout_start`. |
-| Deployment gate | The v0.2 check that decides whether a study's strategy may be deployed. Four stages, run in order, each pass or fail. |
+| Claim | A named hypothesis within a study. One confirmatory run decides it, and that run declares the outcome at close. |
+| Head hash | The hash of a chain's newest row. |
+| Witness | Evidence held outside the researcher's control that a chain had a given head: a signed entry in the public Rekor transparency log, and an OpenTimestamps stamp of the head. |
+| Position hash | The SHA-256 of one period's target positions in canonical form, computed by `bgl.position_hash`. Only the hash is stored, never the positions. |
+| Deployment gate | `bgl gate STUDY`: four stages that decide whether a study's strategy may be deployed. |
+| Deployment-grade | The gate's top level. It requires a custodian, a holdout, a witnessed record and a gate table written before the lock (G1, G2). |
+| Manifest | The files holding everything needed to audit one run: the open manifest and the close file. |
 
-## Functional requirements (v0.1)
+## Writers, chains and keys
 
-Every rule below is enforced in code and has a test that fails if the rule is removed. All checks run before any user code, so a refused run has seen nothing.
+- **Setting up a writer.** `bgl init` sets up the first writer, and `bgl join CODE PERSON` each later one. Either command:
+  - creates an Ed25519 key pair and a machine ID in the user's home config folder;
+  - writes `.bgl/writer` (git-ignored), naming the chain code;
+  - prints the registry entry to add to `bgl.toml`.
+  
+  The registry change must be committed before the writer's first row.
+- **One writer per chain.** Each chain is `<ledger>/<CODE>.jsonl`. Only its writer appends to it, and every other chain on a machine is read-only there.
+- **Signatures.** Every row is signed with its writer's key (R15). The `user` field from git is self-reported; the signature says which registered writer wrote the row.
+- **The registry only grows.** After a study's first lock, writers can be added to the registry, but existing entries never change or disappear. A lost or replaced key means a new chain code. The documentation tells every writer to back up their key, and a custodian especially, because a lost custodian key blocks a handover after sealing.
+- **Machine identity.** Lock checks and the "another machine" test use the machine ID, never the hostname. `verify` fails a chain that has rows from two machine IDs.
 
-**Before a run opens** (R1 to R7 and R3b)
+*Reason:* a laptop and a server appending to one chain would need a hand merge, which is the failure separate chains exist to remove. Signing the rows ties each row to a writer, which a signature on the code commit does not do.
 
-1. **R1. Known study.** The study must be declared in the project config.
-2. **R2. Budget.** If the run type counts, the study must have budget left. Budget is used at open.
-3. **R3. Clean code.** The git working tree must have no uncommitted changes to tracked files, except BGL's own files: the ledger and `runs_dir`. Those change on every run, so they are excluded. The script must be tracked and unchanged. The current commit is recorded. Untracked data files are allowed. `status` warns if the ledger has uncommitted rows.
+## Study lock and amendments
 
-**R3b. No untracked Python files.** Before the run opens, `git ls-files --others --exclude-standard -- '*.py'` must return nothing. Any untracked, non-ignored `.py` file in the repository refuses the run, including the script itself if it is new. *Reason:* this catches almost every untracked-code case before any user code runs, so a refused run has still seen nothing. The refusal names each offending file and both fixes, for example: `Refused (R3b): untracked Python files in the repo: notebooks/try.py. Commit them, or move them to scratch/ (ignored by git).` Files in `scratch/` are git-ignored, so they pass R3b; R17 covers them if a run imports one.
+**The lock.** A study's first counted open writes a `lock` row immediately before its open row (R22). The lock row holds a canonical copy of:
 
-4. **R4. No duplicate.** No earlier open row in the same study may have the same script and the same `what_changed`. A deliberate rerun must say why in `what_changed`.
-5. **R5. Prediction present.** Diagnostic and confirmatory runs must carry a prediction.
-6. **R6. One confirmatory run per claim, plus one bug rerun.** A confirmatory run must name a claim, and that claim must not already have a confirmatory open row. A claim may be voided once: after a void (`void`), the claim may have one more confirmatory run, and that rerun cannot itself be voided. A void is allowed only for a run with status `crashed` or `invalid`, and must name a fix commit made after the voided run that changes tracked code. So a result cannot be voided because the researcher dislikes it. *Reason:* a rule with no bug rerun blocks a claim forever after a bug, and regime_consensus's own spec allows one.
-7. **R7. Ledger intact.** The hash chain must verify before any row is added: open, close, note or refused.
-**Writing the open row** (R13 applies)
+- the study table, including the gate table if one exists;
+- the chain registry at that moment;
+- the SHA-256 of each file in `spec_files`.
 
-After R1 to R7 and R3b pass, the run takes its lock, the manifest is written, then the open row. The open row uses budget. From here on, every outcome except a refusal uses budget, because the researcher may have seen output before the run stopped.
+Numbers are kept in their canonical text (C19). After the lock, every open compares the current config with the locked values plus any accepted amendments. Any other difference refuses the run, and `verify` reports it.
 
-**While the run is open** (R8, R9 and R17 keep their numbers for stable references)
+**Amendments.** `bgl amend STUDY KEY VALUE "reason"` appends an `amend` row. Only these changes are allowed:
 
-**R8. Inputs declared.** The script declares its input files. Their SHA-256 hashes are computed when the open manifest is written and stored in it. A run whose declared input is missing is refused before the open row is written.
+| Key | Allowed change | Effect |
+| --- | --- | --- |
+| `budget` | Increase only | Reported beside the original |
+| `prior_trials` | Increase only | N rises |
+| `claims` | Add a claim | A claim added after the lock cannot reach a deployment-grade verdict |
+| `[gate]` table | Add, if it was absent at the lock | A late gate table is never deployment-grade (G1) |
+| Any gate value or the cost model | Correction only, with `--fix COMMIT` naming the bug fix | The gate shows the original verdict first, and the amended result beside it |
+| `spec_files` content | Any change, with a reason | Reported beside the verdict |
+| Chain registry | Add writers | None |
+| `custodian` | Handover (see below) | Reported. The new custodian must also meet G2 |
+| Holdout keys, `[returns]`, `prefix`, `mode`, witness settings | Never | None |
 
-**R9. Config captured.** The settings the script passes are stored in the open manifest.
+*Reason:* every allowed change makes the evidence weaker on paper, never stronger, so a researcher cannot amend their way to a pass.
 
-**R17. No untracked code (backstop).** While the run is open, the import audit event is recorded. If the run imports a `.py` file inside the repository that git does not track, the run is closed as `invalid`, with the file path as the reason. This backs up R3b: it catches imports from git-ignored folders inside the repository, which R3b does not see. It is why `scratch/` is safe: a file there passes R3b, but importing it closes the run as `invalid`. Code outside the repository is not checked. Budget is used, under R12.
+**Custodian handover.** `bgl amend STUDY custodian PERSON "reason"` names a person in the registry who is not a researcher on the study.
+
+- **Before any `seal` row:** any writer may write the amendment. No key exists yet, so nothing is lost.
+- **After a `seal` row, before the holdout run:** only a writer of the outgoing custodian may write the amendment, so it carries their signature. The new custodian then runs `bgl seal STUDY --reseal` with their own key. The new `seal` row must record the same plaintext hashes as the original, and `verify` checks this. Until the reseal, holdout runs are refused.
+- **After the holdout run:** the holdout has been looked at, so only the custodian's remaining job (incubation and replay runs) moves. The amendment must still be signed by the outgoing custodian.
+
+If the outgoing custodian cannot sign (for example, they have left and their key is lost), no handover is possible after sealing, and the study cannot reach deployment-grade. *Reason:* an unsigned handover would let a researcher name a friendly custodian after the fact.
+
+**New studies on the same data** cannot be prevented. The gate report lists every other study whose declared inputs share a hash with this one.
+
+## Holdout, custodian and sealing
+
+**Files.** A study with a holdout declares `holdout_files`: the files containing holdout-period data. It may also declare `restricted_files`: raw files containing both periods.
+
+**The split.** Before the study lock, a data run reads the restricted files and writes the design and holdout files as declared outputs. Whoever ran it is recorded as the split's provenance:
+
+- *custodian split:* the split run is in the custodian's chain;
+- *researcher split:* the split run is in a researcher's chain;
+- *external:* the files arrived already split. This is declared.
+
+**Sealing.** `bgl seal STUDY` (custodian only) encrypts each holdout file with authenticated encryption from `cryptography` into `<path>.sealed`, which is git-ignored. It records a `seal` row holding the sealed and plaintext hashes. The key stays in the custodian's home config folder. BGL never deletes the plaintext. The custodian deletes it, and `status` and `verify` warn on any machine where a plaintext holdout file still exists.
+
+**Taint.** Any declared output of a run that read a holdout file, or a tainted file, is holdout-derived. Its hash is recorded as tainted. A design run that declares a tainted input is refused (R20). The exception is outputs of split runs before the lock, other than the files listed in `holdout_files`.
+
+**Loading the holdout.** `run.holdout(path)` is the only way a holdout run loads a holdout file. With a seal, it decrypts the file to `.bgl/tmp/`, which is removed at close. It records the position in each captured output stream where the load happened.
+
+**Who may look.** The holdout is looked at once, by the study's confirmatory holdout run. When a custodian is declared, only a custodian writer may open holdout runs and replay runs.
+
+**Solo projects without a custodian** follow the same rules, without sealing or the custodian check. Their studies are not deployment-grade.
+
+*Classes:* checks on declared files and samples are enforced. Reads through Python are detectable. The split script's behaviour is declared; the reviewer checks that it uses no holdout-period information to build the design outputs.
+
+## Witness
+
+Witnessing answers two questions with two services. Rekor, a public transparency log run by Sigstore, shows that no head was thrown away. OpenTimestamps shows when each head existed.
+
+**Submitting.** After every append, BGL submits the writer's new head hash to two places:
+
+- **Rekor:** an entry holding the head hash, signed with the writer's Ed25519 key and carrying the public key. BGL saves the entry's ID and inclusion proof in `<ledger>/witness/<CODE>/`.
+- **OpenTimestamps:** the head hash goes to the declared calendars, and the pending proof is saved in `<ledger>/proofs/<CODE>/`.
+
+Both folders are committed with the ledger.
+
+**At open.** The open row is written, then both submissions are made, and only then does the run's code start (R23). If either fails, for example offline, the run continues and its open is unwitnessed. `bgl witness` retries pending submissions and upgrades pending stamps once Bitcoin confirms them, which takes hours.
+
+**Witness status is worked out, never recorded.** An open is witnessed if:
+
+- a Rekor entry signed by the writer's key covers a head that contains the open row but not its close row, and its inclusion proof verifies against the log's signed checkpoint; and
+- an OpenTimestamps stamp covers that head.
+
+A modified client could delay its submissions, but that is a deliberate cheat and out of scope.
+
+**Detecting discards.** At gate time, BGL lists every Rekor entry made with each registered writer's public key. Every head hash in those entries must appear in that writer's current chain. A head that is missing means the chain was rewritten or a run was thrown away after it was submitted, and G2 fails. `verify --contains HASH` reports whether one recorded head appears in the current chain.
+
+**Checking stamps.** At gate time, each OpenTimestamps proof is checked against Bitcoin block headers from a local node or from at least two independent block explorers that agree. The report records which source was used. The gate needs network access for both checks.
+
+**Public activity.** Rekor entries are public. They contain only hashes and public keys, but anyone can see how often and when each writer opens runs. The documentation says so before a project turns witnessing on.
+
+**Modes.** Team projects must witness (C17). A solo project may set `witness = false`, and its studies are then not deployment-grade.
+
+*Classes:* the submission attempt is enforced. Witness status and discards are detectable.
+
+*Check before building:* whether Rekor's newer API (v2) still supports listing entries by public key, which this design depends on; whether Rekor accepts plain Ed25519-signed hash entries; Rekor's rate limits; the OpenTimestamps calendar submission API; and the verification interface of `opentimestamps`. If listing by public key is unavailable, the fallback is a mirror controlled by the custodian plus a second remote with a different owner. Decide at step 8.
+
+## Functional requirements
+
+Every rule has a test that fails if the rule is removed. Checks before a run opens happen before any code in the `with` block. Code above `start_run` is outside BGL's view (see Scope).
+
+**Rule index** (the canonical list)
+
+| Rule | Name | When | Class |
+| --- | --- | --- | --- |
+| R19 | Writer identity | Before open | Enforced |
+| R7 | Chain intact | Before every append | Enforced |
+| R1 | Known study | Before open | Enforced |
+| R22 | Study lock | Before open | Enforced |
+| R3 | Clean code | Before open | Enforced |
+| R3b | No untracked Python files | Before open | Enforced |
+| R17 | No untracked code loaded | At open and close | Detectable |
+| R8 | Inputs declared | Before open; during the run | Enforced for missing inputs; detectable for undeclared reads |
+| R4 | No duplicate | Before open | Enforced per chain; detectable across chains |
+| R5 | Prediction present | Before open | Enforced presence; declared content |
+| R21 | Variants declared | Before open | Enforced presence; declared value |
+| R6 | Confirmatory runs and void | Before open; `void` | Enforced per chain; detectable across chains; plausibility judged by the reviewer |
+| R20 | Holdout | Before open; during the run | Enforced for declared files and samples; detectable for reads |
+| R2 | Budget | Before open | Enforced per chain; detectable across chains |
+| R9 | Config captured | At open | Enforced capture; declared use |
+| R24 | Other heads recorded | At open | Enforced |
+| R23 | Witness at open | After the open row | Enforced attempt; detectable status |
+| R10 | Always recorded | At close | Enforced; a hard kill is detectable |
+| R11 | Result required | At close | Enforced |
+| R12 | Counts as used | Always | Enforced |
+| R13 | Atomic writes | Every write | Enforced |
+| R14 | Append only | Always | Enforced for BGL; others' edits detectable |
+| R15 | Hash chain and signatures | Every row | Detectable |
+| R16 | Unique IDs | Every row | Enforced |
+| R18 | Ledger lock | Every read and append | Enforced |
+| R25 | Dry runs | `dry=True` | Enforced for reads through Python; C-level reads not covered |
+
+Pre-open checks run in the order of the table. A failure writes one `refused` row and raises `RunRefused`. A refused run uses no budget.
+
+**Before a run opens**
+
+- **R19. Writer identity.** `.bgl/writer` names a registered chain code. The key in the home config folder matches that code's public key in the registry. The machine ID matches the chain's earlier rows. Otherwise the run is refused, and the message names `bgl join`.
+- **R7. Chain intact.** The writer's own chain must verify (hashes, signatures, no torn tail) before any row is added: open, close, note, refused or any other. A broken chain belonging to another writer does not block this writer. `status` and `verify` report it, and it fails the gate (G5).
+- **R1. Known study.** The study is declared in `bgl.toml`.
+- **R22. Study lock.** If the study has no lock row yet and the run is counted, the run writes the lock row before its open row. If a lock exists, the current study table and registry must equal the locked values plus any accepted amendments. Changed spec files need an `amend` row, or a confirmatory run is refused.
+- **R3. Clean code.** The git working tree has no uncommitted changes to tracked files, except BGL's own files: chains, proofs and `runs_dir`. The script must be tracked and unchanged. The current commit is recorded. Untracked data files are allowed. `status` warns if the ledger has uncommitted rows.
+- **R3b. No untracked Python files.** `git ls-files --others --exclude-standard -- '*.py'` must return nothing. The refusal names each offending file and both fixes, for example: `Refused (R3b): untracked Python files in the repo: notebooks/try.py. Commit them, or move them to scratch/ (ignored by git).`
+- **R17 at open.** Every loaded module whose file is inside the repository must be tracked by git. This scan also catches modules imported above the `with` block, and files in ignored folders such as `scratch/`.
+- **R8. Inputs declared.** The run declares its input files. Each must exist, and its size and SHA-256 are stored in the open manifest. Paths are stored with forward slashes. A missing input refuses the run.
+- **R4. No duplicate (counted runs only).** An earlier counted open in the same study with the same script hash, code fingerprint, config hash and input hashes refuses the run.
+  - The code fingerprint is the SHA-256 over the sorted paths and blob hashes of every tracked `.py` file, excluding BGL's files.
+  - `what_changed` must be non-empty, but is not compared.
+  - An exact rerun, for example to check reproducibility, is an exploratory run.
+  
+  *Reason:* one changed word used to defeat the free-text check. The commit cannot be the key, because it changes every time the ledger is committed.
+- **R5. Prediction present.** Diagnostic and confirmatory runs carry a non-empty prediction.
+- **R21. Variants declared.** Non-data runs declare `variants`:
+  - exploratory: 0 or more;
+  - diagnostic: at least 1;
+  - confirmatory and replay: exactly 1.
+  
+  Data runs declare none.
+- **R6. Confirmatory runs and void.**
+  - A confirmatory run lists one or more of its study's claims. Each claim may be decided by only one confirmatory run.
+  - In a study with a holdout, confirmatory runs use `sample = holdout`, and the single holdout look (R20) decides every claim it lists.
+  - It names the design run and variant it confirms (`selects`). In a study without a holdout, the confirmatory run is a design run, and the selected trial is itself.
+  - **Void.** `void RUN_ID "reason" --fix COMMIT` is allowed for a confirmatory run of any status, when its record shows it exposed nothing:
+    - no captured output after the exposure point (the holdout load for holdout runs; the open for other runs); and
+    - no declared outputs written.
+  - The fix commit must descend from the run's commit and change tracked code. A claim may be voided once, and the rerun cannot be voided. The void row goes in the voiding writer's own chain.
+  - *Reason:* basing the void on what the run could have shown closes the crash-on-demand route.
+- **R20. Holdout.** A run with `sample = holdout` is refused if:
+  - the study has `holdout = false`;
+  - the run is not confirmatory;
+  - a custodian is declared and the writer's person is not the custodian;
+  - an earlier holdout open exists in any chain on this machine, unless a void freed it.
+  
+  Also:
+  - A design run is refused if any declared input is a holdout file, a restricted file or a tainted file.
+  - After the lock, any run declaring a restricted file is refused.
+  - `sample = live` is only for replay runs during incubation, by the custodian when one is declared.
+  - The audit hook closes a run as `invalid` if it opens a holdout or restricted file it may not read.
+  - Sample dates are declared: design runs must end before `holdout_start`, and holdout runs must start on or after it.
+- **R2. Budget.** A counted run is allowed only while the study's counted opens are fewer than its budget plus accepted increases. Budget counts counted opens in every chain on this machine. Exploratory and data runs use no budget.
+
+**Writing the open row**
+
+After the checks pass, the run takes its lock, writes the lock row if R22 requires one, writes the open manifest, and then writes the open row.
+
+- **R9. Config captured.** The settings the script passes are stored in the open manifest, and their canonical hash in the open row.
+- **R24. Other heads recorded.** The open row records the head hash of every other registered chain as it is on this machine, or null if that chain is absent. The gate uses these to order chains and to detect a truncated chain.
+- **R23. Witness at open.** After the open row is written and before the run's code starts, BGL submits the new head to Rekor and to the OpenTimestamps calendars (see Witness). A failure does not stop the run.
+
+From the open row on, every outcome except a refusal uses budget, because the researcher may have seen output.
+
+**While the run is open**
+
+- Output is captured for every counted run: stdout and stderr, each to its own git-ignored file.
+- The audit hook records files opened through Python that were not declared (R8).
 
 **When the run ends**
 
-10. **R10. Always recorded.** A finished run gets a close row with its status and result. A run that raises an exception is closed as `crashed`, with the error type and message, and the exception is re-raised. A run interrupted with Ctrl+C is closed as `interrupted`. If the run was already closed by `abandon`, its close is written as `late_close` instead, and `verify` flags it.
-11. **R11. Result required.** A run that finishes without setting a result is closed as `no_result`, not as `ok`.
-12. **R12. Counts as used.** Budget used at open stays used, whatever the status or any void. A voided run still counts as a trial in v0.2's N. *Reason:* the researcher may have seen output before the run stopped.
-13. **R13. Atomic writes.** Each write goes to a temporary file that is then renamed into place. At open, the open manifest is written, then the open row. At close, the close file is written, then the close row. A crash between the two leaves an orphan file with no row, which `verify` reports. There is never a row without its file.
+- **R17 at close.** The loaded-module scan runs again. An untracked module inside the repository closes the run as `invalid`, with the file path as the reason. Code outside the repository and worker processes are not checked.
+- **R10. Always recorded.** A finished run gets a close row. An exception closes it as `crashed`, with the error, and is re-raised. Ctrl+C closes it as `interrupted`. If the run was already closed by `abandon`, the normal close is still written, and `verify` reports it as a late close.
+- **R11. Result required.** A run that finishes without a result is closed as `no_result`, not `ok`.
+- **R12. Counts as used.** Budget used at open stays used, whatever the status or any void. A voided run's variants stay in N.
+
+**Every write**
+
+- **R13. Atomic writes.** Each file goes to a temporary file, which is flushed with `fsync`, renamed into place, and followed by an `fsync` of its folder. The manifest is written before the open row, and the close file before the close row. A crash between the two leaves an orphan file with no row, which `verify` reports. An orphan's run ID is never reused.
+- **R14. Append only.** BGL never edits or deletes a complete row.
+  - **Torn tail.** A final line without a newline is a torn tail. Every append is refused (R7) until `bgl repair` removes it and appends a `repair` row recording the removed bytes' length and SHA-256.
+  - **Corrections** are `note`, `ack`, `void`, `amend` and `abandon` rows. An abandon is a close row with status `abandoned`.
+- **R15. Hash chain and signatures.** Each row stores:
+  - `prev_hash`, the previous row's hash in the same chain;
+  - `hash`, the SHA-256 of the row's canonical JSON without `hash` and `sig`;
+  - `sig`, an Ed25519 signature of the hash by the writer's key.
+  
+  An open row stores its manifest's hash. A close row stores the hashes of its close file, return series file and captured output. `verify` recomputes every hash, checks every signature against the registry, and reports the first broken row in each chain.
+- **R16. Unique IDs.** A run ID is `<prefix>-<letter><counter>-<CODE>`, for example `AL-R007-CG1`.
+  - The letters are R (counted), X (exploratory), D (data), P (replay), F (refused), T (dry) and I (imported).
+  - Counters run separately per study, letter and chain.
+  - The open and close rows of one run share its ID.
+  - IDs are never reused, including an orphan's.
+  - Imported rows keep their original ID in `legacy_id`.
+  - Rows that are not runs (lock, amend, seal, gate and the like) carry the ID of the run they concern, or null.
+- **R18. Ledger lock.** Reads, verification and appends happen under a ledger lock, `.bgl/ledger.lock`, held with the same OS lock as run locks. Two processes on one machine take turns, and both rows chain onto the right head.
+
+**R25. Dry runs.** `start_run(..., dry=True, dry_inputs={declared_path: fixture_path})` runs every check, then runs the script body with each declared input replaced by its fixture.
+
+- While it runs, the audit hook blocks any file open except Python source and compiled files, files inside the Python installation and site-packages, and the declared fixtures.
+- It writes a `dry` row, which uses no budget, and nothing else.
+- C-level readers may get past the hook. The `dry` row keeps the attempt on record.
+
+*Reason:* developers need to test a script's body, but a dry run that could read real data would be an unlogged look at it. Testing analysis functions with ordinary pytest fixtures, outside BGL, is the recommended pattern.
 
 **Unclosed runs.** A run with an open row and no close row is unclosed. A hard kill (power cut, `kill -9`) produces one. A live run is identified by its lock, not by a process ID. Each run holds an OS lock on its lock file for its whole life. `verify` tries to take that lock without waiting:
 
 - **Lock taken by `verify`:** the process that held it is dead. The run is unclosed, and `verify` fails it.
 - **Lock refused:** a live process still holds it. The run is in progress, not a failure.
-- **Another machine, or a synced or network folder:** `verify` cannot see the lock, so it cannot tell. It says so and fails, and asks the user to run `verify` on the machine where the run happened, or to abandon the run.
+- **Another machine (by machine ID), or a synced or network folder:** `verify` cannot tell. It says so, fails, and asks the user to run `verify` on the machine where the run happened, or to abandon the run.
 
-Clearing a failure needs `abandon RUN_ID` with a reason. It appends a close row with status `abandoned` and the reason. It is refused while the lock is held, and on another machine unless `--force` is given with a reason. The run keeps its budget, since its output may have been seen. *Reason:* a warning gets ignored, and a silent unclosed run is the gap the open and close rows exist to expose.
-
-**Ledger rules**
-
-14. **R14. Append only.** The library never edits or deletes a row. Corrections are new `note` rows, `abandon` rows, or `void` rows.
-15. **R15. Hash chain.** Each row stores the SHA-256 of its own contents plus the previous row's hash. A close row also stores the SHA-256 of its close file, and an open row stores the SHA-256 of its open manifest, so editing either file is detected. `verify` recomputes the chain and reports the first broken row.
-16. **R16. Unique IDs.** Run IDs are unique across the project: a per-study prefix, a counter, and the researcher's chain code (for example `EQ-R001-CG`, `EQ-D001-CG`). The chain code keeps IDs unique when several chains exist. Examples elsewhere in this spec omit it. *Chain code added by me; confirm.* The open and close rows of one run share its ID. Existing IDs never change. Imported rows keep their original IDs, which the ID check accepts.
-18. **R18. Ledger lock.** Reads, verification and appends happen under a ledger lock, `.bgl/ledger.lock`, held with the same OS lock as run locks. Each append is flushed with `fsync` before the lock is released. Two runs appending at once take turns: neither row is lost, and both chain onto the same head.
+Clearing a failure needs `abandon RUN_ID "reason"`, which appends a close row with status `abandoned` to the abandoning writer's own chain. It is refused while the lock is held on this machine, and on another machine unless `--force` is given. The run keeps its budget and its variants.
 
 **Lifecycle**
 
 | Outcome | Rows written | Budget used |
 | --- | --- | --- |
-| Refused (R1 to R8 fail) | One `refused` row with the reason | No |
-| Opened, then ends `ok`, `no_result`, `crashed` or `interrupted` | Open row, then close row | Yes |
-| Opened, still running, lock held | Open row only. `verify` reports it in progress | Yes |
-| Opened, then hard kill, lock free on this machine | Open row only. `verify` fails it until abandoned | Yes |
-| Opened, then hard kill, checked on another machine | Open row only. `verify` fails it until abandoned | Yes |
-| `abandon RUN_ID` with a reason | Close row with status `abandoned` | Already used |
-| Untracked repository code imported mid-run (R17) | Open row, then close row with status `invalid` | Yes |
-| `void RUN_ID --fix COMMIT`, on a crashed or invalid confirmatory run | Note row with event `void` and a fix commit | Already used; still counts as a trial |
+| Refused (any pre-open check fails) | One `refused` row with the rule ID and reason | No |
+| First counted open of a study | `lock` row, then open row, then close row | Yes |
+| Opened, then ends `ok`, `no_result`, `crashed` or `interrupted` | Open row, then close row | Yes, if counted |
+| Opened, still running, lock held | Open row only. `verify` reports it in progress | Yes, if counted |
+| Opened, then hard-killed | Open row only. `verify` fails it until abandoned | Yes, if counted |
+| `abandon RUN_ID` | Close row with status `abandoned`, in the abandoning writer's chain | Already used |
+| Untracked repository code loaded (R17) | Close row with status `invalid` | Yes, if counted |
+| `void RUN_ID --fix COMMIT` | `void` row in the voiding writer's chain | Already used; variants stay in N |
+| Dry run | One `dry` row | No |
 
 ## File formats
 
-All files live in the project's git repository and are committed, so git history backs up the hash chain. Git history alone does not prove the chain is complete; see the truncation limit in Scope.
+All committed files live in the project's git repository, so git history backs up each chain. Git history alone does not prove a chain is complete; the witness does that (see Witness).
 
 **Project config** (`bgl.toml` at the repository root)
 
 ```toml
 [project]
-name = "regime_consensus"
-ledger = "Documents/ledger.jsonl"
-runs_dir = "Documents/runs"
+name = "example_project"
+mode = "team"
+ledger = "bgl/ledger"
+runs_dir = "bgl/runs"
 
-[studies.equities]
-budget = 20
-prefix = "EQ"
-claims = ["agreement", "regime_dependence", "switching"]
+[project.chains.CG1]
+person = "researcher_a"
+key = "ed25519:<public key printed by bgl join>"
 
-[studies.crypto]
+[project.chains.CG2]
+person = "researcher_a"
+key = "ed25519:<public key printed by bgl join>"
+
+[project.chains.HC1]
+person = "custodian_a"
+key = "ed25519:<public key printed by bgl join>"
+
+[project.witness]
+rekor_url = "https://rekor.example"
+ots_calendars = ["https://calendar-a.example", "https://calendar-b.example"]
+
+[studies.alpha]
 budget = 20
-prefix = "CR"
-claims = ["agreement", "regime_dependence", "switching"]
+prefix = "AL"
+claims = ["effect_exists", "effect_persists"]
+prior_trials = 0
+holdout_start = 2025-01-01
+holdout_files = ["data/holdout/alpha_holdout.parquet"]
+restricted_files = ["data/raw/prices.parquet"]
+custodian = "custodian_a"
+spec_files = ["docs/studies/alpha.md"]
+
+[studies.alpha.returns]
+periods_per_year = 252
+basis = "Daily close-to-close portfolio return on declared capital"
+risk_free = "data/rates/rf_daily.csv"
+
+[studies.alpha.gate]
+dsr_threshold = 0.95
+psr_threshold = 0.95
+pbo_threshold = 0.05
+pbo_min_trials = 10
+cscv_blocks = 16
+min_block_periods = 20
+min_live_days = 90
+live_witness_lag_days = 3
+
+[studies.alpha.gate.costs]
+model = "flat"
+cost_bps = 5
+
+[studies.alpha.gate.basis]
+dsr_threshold = { kind = "citation", text = "Bailey and López de Prado (2014)" }
+psr_threshold = { kind = "reasoning", text = "Same confidence as the DSR bar, applied to one holdout look" }
+pbo_threshold = { kind = "citation", text = "Bailey et al. (2017), section 3.1" }
+pbo_min_trials = { kind = "reasoning", text = "Below ten trials the rank statistic is too coarse to read" }
+cscv_blocks = { kind = "citation", text = "Bailey et al. (2017)" }
+min_block_periods = { kind = "reasoning", text = "About one trading month per block" }
+min_live_days = { kind = "reasoning", text = "One quarter of live trading before deployment" }
+live_witness_lag_days = { kind = "reasoning", text = "Calendar days; a Friday return written on Monday still passes" }
+costs = { kind = "reasoning", text = "Typical all-in cost for liquid large caps" }
+
+[studies.beta]
+budget = 10
+prefix = "BE"
+claims = ["effect_exists"]
+prior_trials = 12
+holdout = false
+spec_files = []
+
+[studies.beta.returns]
+periods_per_year = 365
+basis = "Daily portfolio return on declared capital, UTC day boundaries"
+risk_free = "none"
+risk_free_reasoning = "Self-financing long-short book; financing is ignored"
 ```
 
-**Ledger** (`ledger.jsonl`): one JSON object per line, appended, never rewritten.
+The numbers and texts in this example show the format. They are not recommended values.
 
-- *Reason for JSON Lines over CSV:* rows can hold nested values (a prediction with several parts), each line is independent so appending never touches earlier rows, and line-by-line git diffs show exactly what was added. A CSV export is a command (`list --csv`).
+**Ledger** (`<ledger>/<CODE>.jsonl`, one chain per writer): one JSON object per line, appended, never rewritten.
+
+- *Reason for JSON Lines over CSV:* rows can hold nested values, each line is independent so appending never touches earlier rows, and line-by-line git diffs show exactly what was added. A CSV export is a command (`list --csv`).
 - *Reason for `event` and `type` as separate fields:* a run has an open row and a close row, so the row kind and the run type cannot share one field.
+- **Canonical bytes.** The bytes hashed are `json.dumps(row, sort_keys=True, separators=(',', ':'), ensure_ascii=False)` without `hash` and `sig`, encoded as UTF-8. Hashed fields hold no JSON floats: every non-integer number is stored as a string in its canonical text (C19), so every implementation writes the same bytes.
+
+**Events:** `open`, `close`, `refused`, `dry`, `note`, `ack`, `void`, `lock`, `amend`, `repair`, `seal`, `imported`, `incubation`, `live_return`, `gate`, `registration`.
 
 | Field | Type | Meaning |
 | --- | --- | --- |
-| `id` | text | Study prefix, then a letter, then a counter: `R` for counted runs, `D` for data runs, `X` for exploratory runs (`EQ-R007`). Imported rows keep their original IDs (for example `R01`) |
-| `event` | text | `open`, `close`, `late_close`, `refused`, `note`, `void`, `imported` (migrate), `registration` (v0.3), or the v0.2 gate events `gate_spec`, `gate`, `incubation`, `live_return` and `deviation` |
-| `study` | text | A study from the config |
-| `type` | text | `data`, `exploratory`, `diagnostic` or `confirmatory`; null on note rows |
-| `counts` | true/false | Whether the run uses budget |
-| `claim` | text or null | The claim a confirmatory run decides |
-| `script` | text | Path of the script, relative to the repository |
+| `id` | text or null | Run ID (R16), or the run a non-run row concerns |
+| `legacy_id` | text or null | Imported rows: the original ID |
+| `event` | text | One of the events above |
+| `chain` | text | The writer's chain code |
+| `study` | text or null | A study from the config |
+| `type` | text or null | `data`, `exploratory`, `diagnostic`, `confirmatory` or `replay`. Null on non-run rows. Whether a run is counted is worked out from this; imported rows also keep their declared `counts`, for display only |
+| `claims` | list or null | Confirmatory open rows: the claims the run decides |
+| `selects` | object or null | Confirmatory open rows: `{run, variant}`, the design trial being confirmed |
+| `variants` | integer or null | Open rows of non-data runs: the number of variants evaluated (declared) |
+| `sample` | text or null | Open rows: `design`, `holdout` or `live` |
+| `sample_start`, `sample_end` | date or null | Open rows: the data dates the run used (declared) |
+| `script` | text | Path of the script, relative to the repository, with forward slashes |
+| `script_sha256`, `code_sha256`, `config_sha256`, `inputs_sha256` | text | Open rows: the facts R4 compares |
 | `what_changed` | text | One change, in words |
-| `prediction` | text or null | Written on the open row, before the run |
-| `status` | text | On open rows: `open`. On close rows: `ok`, `no_result`, `crashed`, `interrupted`, `abandoned` or `invalid`. On refused rows: `refused`. A voided run keeps its status; the `void` row marks it |
-| `result` | text or null | The summary the script set (close rows) |
-| `commit` | text | Git commit ID the run used |
-| `user` | text | Git user name and email. Self-reported unless the commit signature is good |
-| `host` | text | Open rows: name of the machine that opened the run. Checked by `verify` before it looks at the lock |
-| `pid` | integer | Open rows: process ID. Informational only; liveness is decided by the lock |
-| `lock_file` | text | Open rows: path of the lock file. The run's process holds an OS lock on it for the run's life. Machine-local: it sits in `.bgl/locks/`, which git ignores |
-| `started`, `ended` | timestamp | UTC, ISO 8601. Self-reported until v0.3 |
-| `manifest` | text | Path of the open manifest |
-| `manifest_sha256` | text | Open rows: SHA-256 of the open manifest |
-| `close_file` | text or null | Close rows: path of the close file. Null on abandon rows |
-| `close_sha256` | text or null | Close rows: SHA-256 of the close file. Null on abandon rows |
-| `reason` | text or null | Refusal reason, abandon reason, void reason, or note text |
-| `fix_commit` | text or null | Void rows: the commit that fixes the stated bug. It must come after the voided run and change tracked code. `verify` checks both |
-| `sample` | text or null | *v0.1 schema change.* Open rows: `design` or `holdout`. Null on other rows. A holdout run may only use data from the study's `holdout_start` (C11) |
-| `sample_start`, `sample_end` | date or null | *v0.1 schema change.* Open rows: the dates of data the run used. The statistics need these to check that trials share a common sample |
-| `returns_sha256` | text or null | *v0.1 schema change (written from v0.2).* Close rows: SHA-256 of the run's return series file. The file itself is not in git (see Return series file) |
-| `prev_hash` | text | The previous row's `hash` (64 zeros for the first row) |
-| `hash` | text | SHA-256 of this row without `hash`. The bytes are `json.dumps(row, sort_keys=True, separators=(',', ':'), ensure_ascii=False)`, encoded as UTF-8. Hashed fields hold no floats: a fractional number is stored as a string, so every implementation writes the same bytes |
+| `prediction` | text or null | Open rows, written before the run |
+| `status` | text | Open rows: `open`. Close rows: a final status. Refused rows: `refused` |
+| `outcome` | object or null | Confirmatory close rows: each claim mapped to `supported`, `not_supported` or `inconclusive` (declared) |
+| `result` | text or null | Close rows: the summary the script set |
+| `commit` | text | Git commit the run used |
+| `user` | text | Git user name and email. Self-reported; the row signature says which writer wrote the row |
+| `commit_signature` | text | Git's status code for the commit signature (`G`, `B`, `U`, `N`). For information only |
+| `machine_id` | text | The writer's machine ID. Used for lock checks |
+| `host`, `pid` | text, integer | For information only |
+| `lock_file` | text | Open rows: path of the run's lock file in `.bgl/locks/` |
+| `started`, `ended` | timestamp | UTC, ISO 8601. Self-reported; stamps prove existence by a block time |
+| `manifest`, `manifest_sha256` | text | Open rows: the open manifest and its hash |
+| `close_file`, `close_sha256` | text or null | Close rows: the close file and its hash. Null on abandoned closes |
+| `returns_sha256` | text or null | Close rows: hash of the return series file |
+| `output_sha256` | object or null | Close rows: hash of each captured output stream |
+| `other_heads` | object or null | Open rows: each other registered chain mapped to its head hash on this machine, or null (R24) |
+| `reason` | text or null | Refusal reason and rule ID, abandon reason, void reason, note text, or amendment reason |
+| `fix_commit` | text or null | Void and correction-amendment rows: the fixing commit |
+| `amend` | object or null | Amend rows: `{key, old, new}` |
+| `lock` | object or null | Lock rows: canonical study table, chain registry and spec-file hashes |
+| `seal` | object or null | Seal rows: each holdout file's plaintext and sealed hashes |
+| `removed` | object or null | Repair rows: `{length, sha256}` of the removed bytes |
+| `period`, `value`, `turnover`, `cost` | text or null | Live-return rows: the period, its portfolio return, its turnover and its realised trading cost as a return drag, all as strings (declared) |
+| `position_sha256` | text or null | Live-return rows: the position hash of the period's target positions |
+| `live_inputs` | object or null | Live-return rows: each recorded live input file's path and SHA-256, saved by the live system for the replay |
+| `report_sha256` | text or null | Gate rows: hash of the gate report |
+| `format_version` | integer | Format version of this row |
+| `prev_hash` | text | The previous row's `hash` in this chain (64 zeros for the first row) |
+| `hash` | text | SHA-256 of the canonical bytes |
+| `sig` | text | Ed25519 signature of `hash` by the writer's key |
 
-Refused runs get one `refused` row with the reason, and never use budget. *Reason:* a refusal is evidence that the rules worked.
+Refused runs get one `refused` row and never use budget. *Reason:* a refusal is evidence that the rules worked.
 
-Fields marked *v0.1 schema change* are added before v0.1 is released, so no existing row ever needs migrating. After release, the same change would need a `format_version` bump and a migration.
-
-**Open manifest** (`runs/EQ-R007.json`): written at open and never rewritten.
+**Open manifest** (`<runs_dir>/<ID>.json`): written at open, never rewritten.
 
 - `config`: the settings the script passed.
 - `inputs`: each declared input's path, size and SHA-256.
 - `environment`: Python version, platform, and the SHA-256 of `uv.lock` (or the installed package list if there is no lock file).
-- `git`: commit, branch, whether untracked files existed, user, and `signature`: git's own status code for the commit signature (`G` good, `B` bad, `U` good but unknown key, `N` unsigned).
-- `files_opened`: files opened through Python during the run that were not declared as inputs. See R8.
-- `costs` *(v0.1 schema change)*: the cost model the run declares: a per-trade cost, a slippage estimate and a sensitivity multiplier. Optional in v0.1 and recorded when given; the gate's stage 3 requires it.
-- `stdout`, `stderr`, `holdout_load_offset` *(v0.1 schema change)*: the output a run produced, captured and hashed, and the position in it where the holdout was loaded. Captured for every run with `sample = holdout`. *Reason:* G3 has to prove what a run exposed, and only captured output can show it. *Stderr is my addition:* a warning sent through `logging` also counts as exposure.
+- `git`: commit, branch, whether untracked files existed, user, commit signature status.
+- `costs`: a copy of the study's locked cost model. *Reason:* the gate checks that every counted run used the locked model.
 
-**Close file** (`runs/EQ-R007.close.json`): written at close.
+**Close file** (`<runs_dir>/<ID>.close.json`): written at close.
 
 - `outputs`: each declared output's path and SHA-256.
+- `files_opened`: files opened through Python during the run that were not declared (R8).
+- `untracked_modules`: the result of the R17 scan at close.
 - `notes`: remarks added with `run.note`. A note is lost if the run is hard-killed before close.
 - `error`: type, message and traceback, for crashed runs.
+- `output`: the captured stdout and stderr files, their SHA-256, and the holdout load position in each stream.
+- `series`: per variant, the statistics BGL computed from the return series (T, mean, standard deviation, Sharpe, skewness, kurtosis), as strings.
+- `positions`: replay runs only, each period mapped to its position hash.
+- `outcome`: as in the close row.
 
-**Return series file** (`runs_dir/returns/EQ-R007.csv`): *v0.1 schema change; written from v0.2.* Written at close for every counted run, including voided runs, because PBO needs every trial.
+**Return series file** (`<runs_dir>/returns/<ID>.csv`): written at close for every counted run that called `run.returns`, voided runs included, because PBO needs every trial.
 
-- *Content:* one portfolio-level daily return series for the run. Never per-asset returns, never raw data.
-- *Git:* the `returns/` folder is git-ignored, so the series never enters the repository. `init` adds it to `.gitignore`. Manifests and close files stay committed; only this folder is ignored.
-- *Backup:* the owner backs up `runs_dir/returns/` privately, for example to a university OneDrive. This is a copy of the folder, never the project itself, since the project must not sit in a synced folder (see Scope).
-- *Format:* deterministic, so the hash can be reproduced. Fixed column order, UTF-8, LF line endings, ISO dates, and a fixed number of decimal places set by `format_version`. The same series must always give the same bytes.
-- *Hash:* the file's SHA-256 goes into the close row. Nothing else about the series goes into the ledger.
-- *Missing files:* on a machine without the series, `verify` reports them as not checkable rather than passing them. Abandoned runs with no series are listed in the gate report as "missing from PBO" and are never dropped silently.
-- *Licence:* before the first counted run, the owner confirms that the data licence allows storing the derived series locally. Where a licence forbids it, that study is excluded from PBO, and the report states why.
+- *Content:* long format with columns `period,variant,gross,turnover`, sorted by variant and then period.
+  - Gross return is portfolio-level and before costs.
+  - Turnover is $\tau_t = \sum_i |w_{i,t} - w_{i,t-1}|$, as computed by the script (declared).
+  - Never per-asset values, never raw data.
+- *Periods:* ISO 8601 dates, or UTC datetimes ending in `Z` for intraday studies. Every variant is on the study's period grid.
+- *Format:* deterministic. UTF-8, LF line endings, and a fixed number of decimal places set by `format_version` (10 in version 1). The same series always gives the same bytes.
+- *Git:* the `returns/` folder is git-ignored. `init` adds it to `.gitignore`.
+- *Backup:* the owner backs up `returns/` privately, as a copy of the folder, never the project itself, since the project must not sit in a synced folder.
+- *Missing files:* on a machine without the series, `verify` reports them as not checkable rather than passing them.
+- *Licence:* before the first counted run, the owner confirms that the data licence allows storing the derived series locally. Where it does not, the study cannot compute PBO, and stage 2 fails with that reason.
 
-The close row holds the SHA-256 of both the close file and the open manifest, so editing either after the fact is detected.
+**Captured output** (`<runs_dir>/output/<ID>.stdout` and `.stderr`): git-ignored, because output may contain licensed data. Only their hashes are committed.
 
-**The lock.** On Linux and macOS, the run holds `fcntl.flock` with an exclusive lock. On Windows, it holds `msvcrt.locking`. The lock is held on an open file, not inferred from the file's existence, because a crash leaves the file behind. Locks are unreliable on network drives and inside synced folders (OneDrive, Dropbox, iCloud Drive, Google Drive), where students often keep projects. `init` warns when the project sits in one, and the documentation says so. Lock files live in `.bgl/locks/` and are never committed.
+**Proofs** (`<ledger>/proofs/<CODE>/<head>.ots`): committed.
 
-## Config rules (bgl.toml, v0.1)
+**Local files.** `.bgl/` holds the writer file, run locks, the ledger lock and temporary decrypted holdout files. It is git-ignored and machine-local. Keys and the machine ID are in the user's home config folder.
 
-Enforced by the config loader. Each rule has a test that fails if the rule is removed. Every error names the file, the key and what was expected.
+**Line endings and paths.** `init` adds entries to `.gitattributes` that turn off line-ending conversion for the ledger folder and `runs_dir`, so hashed files never change bytes in git. Every stored path uses forward slashes.
 
-1. **C1. Project name.** `[project] name` is a non-empty string.
-2. **C2. Paths.** `ledger` and `runs_dir` are relative paths. They must not be absolute, and must not resolve to a location outside the repository.
+**Supported git workflow.** Commits that runs used must stay reachable: branches carrying them are merged or fast-forwarded, never squashed or rebased, and CI checks out full history. `verify` reports an unreachable commit as its own failure ("commit not reachable"), with this explanation.
+
+**The lock file.** On Linux and macOS, a run holds `fcntl.flock` with an exclusive lock; on Windows, `msvcrt.locking`. The lock is held on an open file, not inferred from the file's existence, because a crash leaves the file behind. Locks are unreliable on network drives and inside synced folders (OneDrive, Dropbox, iCloud Drive, Google Drive). `init` warns when the project sits in one.
+
+## Config rules (bgl.toml)
+
+The config loader enforces these. Each rule has a test that fails if the rule is removed. Every error carries:
+
+- its rule ID (for example `C3`);
+- the file;
+- the key path (for example `studies.alpha.budget`);
+- the value found and what was expected.
+
+Loading runs in two phases.
+
+- **Phase 1** (reading the file: C8, C9) fails fast with a single `ConfigError`, because there is nothing to check without a parsed file.
+- **Phase 2** (every other rule) collects every error. A check on a field whose parent table is missing or invalid is skipped, so one mistake never produces follow-on errors. For example, C15 is skipped when the chain registry is invalid, and C6 compares only prefixes that passed C4.
+
+At the end, the loader raises one `ConfigErrorGroup` (a subclass of `ExceptionGroup`) if any error was collected. Otherwise it builds the config records, which use read-only mappings. Tests match on the rule ID and key path, not on message wording. No key has a default: a missing key is always an error. *Reason:* a forgotten key that silently takes a default (a zero `prior_trials`, say) understates N without anyone noticing.
+
+**Shared checks**
+
+- *Whole numbers* (`budget`, `prior_trials`, `cscv_blocks`, `periods_per_year` and every other count) use one check: an integer, not a boolean, at least the stated minimum. *Reason:* in Python a boolean counts as an integer, so `budget = true` would otherwise pass as 1.
+- *Decimals* are Python floats, `tomllib`'s default. A key that takes a decimal also accepts a TOML integer, which is converted to a float, so `cost_bps = 5` and `cost_bps = 5.0` are the same value. Booleans are refused. *Reason:* the statistics are computed in floats, so config values never have to be converted between number types, and a harmless reformat such as `0.95` to `0.950` gives the same value and the same lock.
+- *Paths* use C2's checks.
+- *Non-finite numbers:* TOML allows `nan` and `inf`. Both are rejected wherever a number is expected. *Reason:* every comparison with nan is false, so a nan threshold would silently pass or fail everything.
+- *Boundaries:* every range in these rules states whether each end is included. Each range has a test at its exact boundary.
+
+**Rules**
+
+1. **C1. Project table.** A `[project]` table exists, and its `name` is a non-empty string. A `[studies]` table exists; it may be empty. *Reason:* no key has a default, so a missing table is an error, but a project may be set up before its first study. A run against no study is refused by R1.
+2. **C2. Paths.** Every path in the config (`ledger`, `runs_dir`, `holdout_files`, `restricted_files`, `spec_files`, `risk_free`) is relative, uses forward slashes, and does not resolve outside the repository.
 3. **C3. Study budget.** Each study's `budget` is a whole number, zero or more.
 4. **C4. Study prefix.** Each study's `prefix` is 2 to 4 uppercase letters.
-5. **C5. Claims.** Each study's `claims` is a list of unique, non-empty strings. An empty list is allowed.
-6. **C6. Unique prefixes.** No two studies share a prefix. *Derived from R16:* run IDs must be unique across the project, and two studies with the same prefix would produce colliding IDs. *Added by me; confirm before building.*
-7. **C7. Unknown keys.** A key the loader does not recognise is an error. *Reason:* a misspelt key such as `budgt = 20` would otherwise be ignored silently, and the study would run with no budget. *Added by me; confirm before building.*
-8. **C8. Missing file.** If `bgl.toml` does not exist, the error tells the user to run `bgl init`.
-9. **C9. Invalid TOML.** A syntax error reports the file and the line.
-10. **C10. Gate thresholds.** If a study has a `[gate]` table, every threshold it needs is present and lies in its valid range. The loader knows these keys from v0.1, so C7 does not reject them. *Added for the v0.2 gate.*
-11. **C11. Holdout start.** A study with holdout runs declares `holdout_start`, a date. Design runs must use data before it, and holdout runs must use data from it on. *Reason:* the holdout is only a test if the two samples cannot overlap. *Added for the v0.2 gate; enforced from v0.1 because the sample is recorded at open.*
-12. **C12. Chain registry.** `bgl.toml` lists every expected ledger chain by chain code, one per researcher. `ledger` is a folder holding one `<chain>.jsonl` per registered chain, and C2 applies to it. The gate fails if a registered chain is missing. *Added for multi-researcher use.*
+5. **C5. Claims.** Each study's `claims` is a list of unique, non-empty strings. An empty list is allowed. Claim names are scoped to their study.
+6. **C6. Unique prefixes.** No two studies share a prefix. *Reason:* run IDs must be unique across the project (R16).
+7. **C7. Unknown keys.** A key the loader does not recognise is an error. *Reason:* a misspelt key such as `budgt = 20` would otherwise be ignored silently.
+8. **C8. Missing or unreadable file.** If `bgl.toml` does not exist, the error tells the user to run `bgl init`. A folder at that path, or a file that cannot be read, is also C8.
+9. **C9. Invalid TOML.** A syntax error, or a file that is not UTF-8, reports the file and, where known, the line.
+10. **C10. Gate table.** A study's `[gate]` table is optional. If present, it holds exactly these keys, each in range:
+    - `dsr_threshold` and `psr_threshold`: numbers strictly between 0 and 1;
+    - `pbo_threshold`: a number above 0 and at most 0.5;
+    - `pbo_min_trials`: a whole number, at least 2;
+    - `cscv_blocks`: a whole number, at least 4 and even;
+    - `min_block_periods`, `min_live_days` and `live_witness_lag_days`: whole numbers, at least 1.
+    
+    A `costs` table holds `model = "flat"` and `cost_bps` (a number, zero or more), the cost per unit of turnover in basis points. A `basis` table holds one entry for each gate key and one for `costs`, and nothing else. Each entry has `kind` (`citation` or `reasoning`) and non-empty `text`.
+    
+    *Reason for the 0.5 cap:* above 0.5, a study would pass even when picking its best trial does worse than chance.
+11. **C11. Holdout.** Every study declares exactly one of `holdout_start` (an unquoted TOML date, no time) or `holdout = false`.
+    - With `holdout_start`, `holdout_files` is a non-empty list of paths, and `restricted_files` is a list of paths, which may be empty. The two lists share no path.
+    - With `holdout = false`, `holdout_files`, `restricted_files` and `custodian` are errors.
+    
+    *Reason:* the holdout is only a test if the two samples cannot overlap, and a missing key must never mean "no holdout" by accident.
+12. **C12. Chain registry.** `[project.chains]` holds one table per writer. Its code is an uppercase letter followed by uppercase letters or digits, 2 to 6 characters long, with no code appearing twice. Each entry has `person` (non-empty) and `key`: the text `ed25519:` followed by the standard base64 encoding of the 32-byte raw public key, which must decode to exactly 32 bytes. The registry is non-empty. Each registered chain's file lives in `ledger`.
+13. **C13. Prior trials.** Every study declares `prior_trials`, a whole number, zero or more, even when it is 0.
+14. **C14. Mode.** `[project] mode` is `solo` or `team`. In `team` mode, every study with a holdout declares a `custodian`, and witnessing is on (C17).
+15. **C15. Custodian.** `custodian`, when present, names a `person` in the registry. In `solo` mode it may be absent. The gate checks that the custodian ran none of the study's design runs (G2).
+16. **C16. Returns.** Every study has a `[returns]` table with:
+    - `periods_per_year`: a whole number, at least 1;
+    - `basis`: a non-empty description of what a return is measured on;
+    - `risk_free`: a path to a file of per-period risk-free returns on the study's grid, or `"none"`. With `"none"`, `risk_free_reasoning` is a required non-empty string.
+17. **C17. Witness.** `[project.witness]` holds `rekor_url` (an HTTPS URL) and `ots_calendars` (a non-empty list of HTTPS URLs). A `solo` project may instead set `witness = false` under `[project]`. A `team` project may not.
+18. **C18. Spec files.** Every study declares `spec_files`, a list of paths, which may be empty.
+19. **C19. Canonical values.** A decimal key's value is converted to a float and written as Python's shortest round-trip text for that float (its `repr`), stored as a string. Integers are written as integers. Dates are ISO 8601 text. The canonical study table used by the lock contains no JSON floats. *Reason:* the shortest round-trip text of a float is the same on every platform, so the lock reproduces the same bytes on every machine.
+20. **C20. Placeholders.** A basis text, a `key`, a calendar URL or the Rekor URL that equals one of BGL's documented placeholder strings, or contains `<` or `>`, is an error. *Reason:* an unedited template must not load.
 
 ## Python API
 
-One function opens a run; the run object records everything else. A script needs about five extra lines.
+One function opens a run; the run object records everything else.
 
 ```python
 from bgl import start_run
 
 with start_run(
-    study="equities",
+    study="alpha",
     run_type="diagnostic",
     script=__file__,
-    what_changed="Correlation pre-check on six signal scores",
-    prediction="Bollinger dropped as a near-copy of z-score",
-    inputs=["data/derived/signals.parquet"],
-    config={"corr_threshold": 0.7},
+    what_changed="Lookback grid 10 to 60 days in steps of 10",
+    prediction="Sharpe rises with lookback up to about 40 days, then flattens",
+    inputs=["data/design/alpha_design.parquet"],
+    config={"lookbacks": [10, 20, 30, 40, 50, 60]},
+    sample="design",
+    sample_start="2015-01-02",
+    sample_end="2024-12-31",
+    variants=6,
 ) as run:
-    table = compute(...)          # the analysis
-    run.output("data/derived/correlations.parquet")
-    run.result("Kept macd, rsi_50; dropped rate_of_change")
+    gross, turnover = run_grid(...)  # the research code
+    run.returns(gross=gross, turnover=turnover)
+    run.result("Best lookback 40; flat above it")
 ```
 
 | Call | Does |
 | --- | --- |
-| `start_run(...)` | Runs checks R1 to R9, then writes the manifest and open row. Takes `sample` (`design` or `holdout`) and an optional `costs` record (v0.1 schema change). Raises `RunRefused` with the reason if any check fails, after recording the refusal. |
-| `run.output(path)` | Declares an output file. Its hash is recorded when the run closes. |
+| `start_run(...)` | Runs the pre-open checks, then writes the lock row if needed, the manifest and the open row, then witnesses. Also takes `claims` and `selects` for confirmatory runs, and `dry` and `dry_inputs` for dry runs. Raises `RunRefused` with the rule ID and reason after recording the refusal. |
+| `run.returns(gross, turnover)` | Takes, per variant, a gross return series and a turnover series on the study's period grid. Writes the return series file, puts its hash in the close row, and stores per-variant statistics in the close file. Refuses series off the grid, a variant count different from the declared one, and dates outside the declared sample. |
+| `run.holdout(path)` | The only way a holdout run loads a holdout file. Decrypts sealed files to a temporary location and records the load position in the captured output. |
+| `run.positions(period, weights)` | Replay runs only: takes one period's target weights (asset identifier to weight), computes the position hash, and records only the hash. |
+| `position_hash(weights)` | The function the live system calls to compute the same hash for its `live_return` rows. Weights are rounded to the number of decimal places fixed by `format_version` (8 in version 1), sorted by asset identifier, written as canonical text and hashed with SHA-256. |
+| `run.output(path)` | Declares an output file. Its hash is recorded at close, and it is marked tainted if the run read holdout data. |
 | `run.result(text)` | Sets the summary. Required for status `ok`. |
-| `run.note(text)` | Adds a remark, for example a warning seen during the run. Written to the close file. |
-| `run.id` | The run's ID, for printing or naming outputs. |
-| `run.returns(series, periods_per_year=252)` | v0.2. Writes the series to the git-ignored returns folder, puts its hash in the close row, and stores the series' statistics in the close file. |
-| `run.holdout(...)` | *v0.1 schema change.* The only way a run with `sample = holdout` loads holdout data. It records where in the captured output the load happened. Without that marker, G3 cannot be checked. |
-| `verify_ledger()` | Recomputes the hash chain. Returns the first broken row, or none. |
-| `budget(study)` | Runs used and left in a study. |
-| `add_note(run_id, text)` | Appends a `note` row correcting or annotating an earlier run (R14). |
+| `run.outcome(claim, value)` | Confirmatory runs: declares a claim's outcome (`supported`, `not_supported`, `inconclusive`). |
+| `run.note(text)` | Adds a remark to the close file. |
+| `run.id` | The run's ID. |
+| `verify_ledger()` | Verifies every chain on this machine. Returns the first broken row per chain. |
+| `budget(study)` | Counted runs used and left in a study, over the chains on this machine. |
+| `add_note(run_id, text)` | Appends a `note` row (R14). |
 
 - **On exit**, the run writes its close file, then its close row. An exception is recorded as `crashed` and re-raised. Ctrl+C is recorded as `interrupted`.
-- **Confirmatory runs** also pass `claim="agreement"` (R6).
-- **Data runs** use `run_type="data"` and need no prediction.
-- **Dry runs:** `start_run(..., dry=True)` runs every check and prints what would be recorded. It writes nothing. *Reason:* developers need to check that a script starts, but a dry run that could see the data would be an unlogged look at it.
-
-**Enforcement of reads.** Files opened through Python during a run are recorded by an audit hook (PEP 578, `sys.addaudithook`). Undeclared reads are listed in the open manifest. This is detection, not prevention: C-level readers such as pyarrow may bypass the hook, so the claim must be worded as "files opened through Python are recorded; others may not be". Test this before the README claims more. **Decided 18/11/26:** dry runs enforce this. They cannot read declared inputs, using the audit hook. The C-level reader gap applies, as listed under known limitations.
+- **Data runs** use `run_type="data"` and need no prediction, variants or returns.
+- **Confirmatory holdout runs** pass `claims=[...]`, `selects={"run": "AL-R012-CG1", "variant": 4}`, `sample="holdout"` and `variants=1`.
 
 ## Command-line tool
 
-The command-line tool reads and checks; it never creates a run. Runs are only made from scripts, through `start_run`. *Reason:* a tool that could start runs would be a second route around the rules.
+The command-line tool never creates a run; runs are made only by scripts through `start_run`. *Reason:* a tool that could start runs would be a second route around the rules.
 
-| Command | Output |
-| --- | --- |
-| `init` | Writes a starter `bgl.toml` and an empty ledger. Refuses if either exists. Creates `scratch/` and `runs_dir/returns/` and adds both to `.gitignore`, appending only if the entry is missing and never overwriting the file. Warns if the project sits inside a synced folder (OneDrive, Dropbox, iCloud Drive, Google Drive) or a network path, where locks are unreliable. |
-| `status` | Budget used and left per study; claims decided and open; count of unclosed runs; voided runs; the ledger's head hash, to record outside the repository. Warns if the ledger has uncommitted rows. |
-| `list [--study S] [--csv]` | One line per run, newest last. `--csv` exports for spreadsheets. |
-| `show RUN_ID` | The run's open and close rows and manifests, readable. |
-| `verify` | Checks the hash chain; that every close row has an open row; that every open row has a close row, or is in progress on this machine (see Unclosed runs); that every manifest and close file exists and matches its hash; that recorded commits exist in git; and that no manifest or close file is orphaned. It checks each return series file against its hash. On a machine without the series, it reports them as not checkable rather than passing them. On another machine it reports that it cannot tell whether a run is live, and fails. Flags any `late_close` row. Exits non-zero on any failure, so it can run in CI. |
-| `note RUN_ID "text"` | Appends a `note` row. With `abandon` and `void`, these are the only writes the command line can make. |
-| `void RUN_ID "reason" --fix COMMIT` | Appends a `void` row marking a crashed or invalid confirmatory run as a bug, which frees one more run for its claim (R6). `--fix` must name a commit made after the voided run that changes tracked code; `verify` checks both. One void per claim. The run keeps its budget and its trial count. |
-| `abandon RUN_ID "reason"` | Closes an unclosed run with status `abandoned` and the reason. Refused while the run's lock is held on this machine. On another machine it is refused unless `--force` is given with a reason. Keeps the run's budget. |
-| `migrate --from-csv PATH` | One-off import of an older log (used for regime\_consensus). Imported rows keep their original IDs and their `counts` values (crypto's 6 used runs still count), and are marked `imported`, since their commits and inputs were not recorded. |
+| Command | Writes | Does |
+| --- | --- | --- |
+| `init` | Config, first writer | Writes a starter `bgl.toml` (with no gate table), the first writer's key and registry entry, an empty chain, `.gitignore` entries (`.bgl/`, `scratch/`, `<runs_dir>/returns/`, `<runs_dir>/output/`, `*.sealed`), and `.gitattributes` entries. Never overwrites a file, and appends only missing entries. Warns inside a synced folder or on a network path. |
+| `join CODE PERSON` | Local files | Sets up a new writer on this machine and prints its registry entry. |
+| `status` | No | Per study: budget used and left, N so far, claims decided and open, unclosed runs, voided runs, plaintext holdout files present, unwitnessed opens. Per chain: head hash and witness state. Warns about uncommitted ledger rows. |
+| `list [--study S] [--csv]` | No | One line per run, newest last. |
+| `show RUN_ID` | No | The run's rows and manifests, readable. |
+| `verify [--contains HASH]` | No | Checks every chain and file (see below). Exits non-zero on any failure, so it can run in CI. |
+| `note RUN_ID "text"` | `note` | Annotates a run. |
+| `ack RUN_ID "reason"` | `ack` | Acknowledges a late close after review, which lets G3 pass with a note. |
+| `abandon RUN_ID "reason" [--force]` | Close row | Closes an unclosed run (see Unclosed runs). |
+| `void RUN_ID "reason" --fix COMMIT` | `void` | Voids a confirmatory run (R6). |
+| `amend STUDY KEY VALUE "reason" [--fix COMMIT]` | `amend` | Applies a typed amendment (see Study lock and amendments). |
+| `repair` | `repair` | Removes a torn tail from this writer's chain (R14). |
+| `seal STUDY [--reseal]` | `seal` | Custodian only: seals the holdout files, or reseals them with a new custodian's key after a handover. |
+| `witness` | No | Retries pending Rekor and OpenTimestamps submissions, and upgrades pending stamps. |
+| `incubate STUDY` | `incubation` | Custodian (or the researcher in solo mode): starts incubation for the confirmatory commit. |
+| `live STUDY --from FILE` | `live_return` | Appends one row per live period, each witnessed: the return, turnover, realised cost, position hash and recorded input-file hashes, written by the live system. |
+| `gate STUDY [--bitcoin-node URL \| --explorers A,B]` | `gate` | Runs the deployment gate and writes its report. |
+| `stats dsr RUN_ID` | No | Shows the DSR inputs and result for one trial. |
+| `register STUDY` | `registration` | Optional: bundles the spec files, their hashes and the head hashes for public registration on OSF. |
+| `migrate --from-csv PATH` | `imported` | One-off import of a log kept before adoption (see below). |
 
-## v0.2: trial counting and the deflated Sharpe ratio
+**`verify` checks:**
 
-v0.2 reports every strategy's Sharpe ratio next to its **deflated** Sharpe ratio, using a trial count the library already knows, so selection bias is corrected without the researcher having to remember how many things they tried.
+- every chain's hashes and signatures, and that no torn tail exists;
+- that every close row has an open row, and every open row has a close row or is in progress on this machine;
+- late closes, each flagged until acknowledged;
+- that every manifest, close file, return series and captured output matches its hash (or is reported not checkable where missing);
+- orphan files;
+- that recorded commits are reachable;
+- that the config matches each lock plus its amendments;
+- that no chain has rows from two machines;
+- that no plaintext holdout file is present;
+- `--contains` membership of a given hash.
 
-**The method.** The deflated Sharpe ratio (Bailey and López de Prado, 2014, *Journal of Portfolio Management* 40(5), 94 to 107) is the probability that the true Sharpe ratio beats the best Sharpe ratio expected from N zero-skill trials, allowing for skewness and fat tails. The probabilistic Sharpe ratio against a hurdle SR\* is
+**`migrate`.** The import file is in BGL's documented import format: one row per past run, with ID, study, run type, counts, claim, sample, what changed, start and end times, status and result. Each project converts its own old log into this format. Imported rows:
 
-```latex
-\mathrm{PSR}(SR^*) = \Phi\left( \frac{(\widehat{SR} - SR^*)\sqrt{T-1}}{\sqrt{1 - \hat\gamma_3 \widehat{SR} + \frac{\hat\gamma_4 - 1}{4}\widehat{SR}^2}} \right)
-```
+- keep their original ID in `legacy_id`, and get an I-letter ID;
+- keep their declared study;
+- are marked `imported`, since their commits and inputs were never recorded.
 
-and the hurdle is the expected maximum of N zero-skill trials:
+They are display-only for budget and N: legacy trials enter N only through `prior_trials`, which must be at least the number of imported non-data rows in the study. They are binding for claims and the holdout: an imported confirmatory row decides its claims, and an imported holdout row uses up the holdout. A row whose study is missing or not in the config is refused, and so is any import that would change an existing row's study. The import is all or nothing.
 
-```latex
-SR^* = \sqrt{\mathrm{Var}\big[\widehat{SR}_n\big]} \left( (1-\gamma)\,\Phi^{-1}\!\left(1 - \tfrac{1}{N}\right) + \gamma\,\Phi^{-1}\!\left(1 - \tfrac{1}{N e}\right) \right)
-```
+## Trials and N
 
-Here T is the number of returns, gamma-hat-3 the skewness, gamma-hat-4 the kurtosis (not excess), Phi the normal distribution function, and gamma about 0.5772 the Euler-Mascheroni constant. **Check every symbol against the paper before implementing**; this is the standard published form, not a derivation.
+$$N = \text{prior\_trials} + \sum_{\text{non-data design runs}} \text{variants}$$
 
-**What the library adds** (the formula is already implemented elsewhere, for example R's quantstrat):
+- The sum covers every non-data run with `sample = design`, in every registered chain, of any status, voided runs included. Exploratory runs are included.
+- Confirmatory holdout runs, replay runs, data runs and imported rows are not included.
+- N is a lower bound (see Scope). The gate report shows N broken down by prior trials, run type and chain.
 
-1. **N comes from the ledger**, not from memory: every counted run in the study that produced a return series is a trial, including voided runs.
-2. **Prior untracked trials are declared once** in the config (`prior_trials = 38` for regime\_consensus's V1 and V2) and are always added to N. The key belongs to the study the trials were run for, never to another study. *Reason:* hiding earlier searches is the main way selection bias enters.
-3. **The variance of trial Sharpe ratios** comes from the recorded trials. With fewer than 2 recorded trials, a stated default is used and flagged.
-4. **New API:** `run.returns(series, periods_per_year=252)` writes the return series to a returns file, hashes it into the close row, and stores its Sharpe, length, skewness and kurtosis in the close file. The series is kept because PBO needs every trial's returns, which the earlier "statistics only" choice ruled out. `stats dsr RUN_ID` on the command line.
+*Reason:* N measures the search. A run that tested 500 variants searched 500 times, whatever its budget cost.
 
-**Open questions for v0.2:** trials are rarely independent, so N overstates the effective number. López de Prado suggests clustering trials to estimate an effective N; v0.2 reports the raw N as the primary figure. Effective N may appear later, as a labelled sensitivity check only, never as the primary figure. Also read before building: Harvey and Liu (2015), *Backtesting*, on Sharpe ratio haircuts, as an alternative correction.
+## Statistics
 
-## v0.2: deployment gate (`bgl gate STUDY`)
+All statistics are per period, on net excess returns. Annualised figures are for display only. Implemented with `numpy`. Every formula is checked against its source before building.
 
-The gate answers one question: may this study's strategy be deployed with real money? It computes no new kind of statistic. It combines governance, statistics, implementability and live evidence, and refuses when any part fails.
+**Net excess returns.** For variant $v$ in period $t$, with gross return $g_t$, turnover $\tau_t$, locked cost $c$ (the `cost_bps` value divided by $10^4$) and risk-free return $f_t$ from the locked file (zero when `risk_free = "none"`):
 
-*Reason it sits in BGL and not in a separate library:* the statistics already exist elsewhere (factor-qc, sharpebench, pypbo, alphaengine). What none of them has is a trustworthy count of the trials actually run, and the ledger already records that count. The gate's contribution is that count plus the rules that stop it being gamed.
+$$r_t = g_t - \tau_t\, c - f_t$$
 
-**Order and verdict.** The verdict is the first failing stage, and nothing later can change it. Stage 1 failing halts the gate before any statistic is computed. Stages 2 and 3 are independent of each other, so both always run and both are reported. Stage 4 (incubation) starts only when stages 1 to 3 all pass. *Reason for the order:* if governance fails, the statistics are computed on a record that may be incomplete, so their numbers are not evidence. Live incubation comes last because it costs the most calendar time.
+**Estimators.** For a series of $T$ returns:
+
+- $\widehat{SR} = \bar r / s$, where $s$ is the standard deviation with divisor $T-1$;
+- $\hat\gamma_3$ and $\hat\gamma_4$ are the population skewness and kurtosis, with divisor $T$. The kurtosis is not excess, so a normal distribution gives 3.
+
+**PSR** against a hurdle $SR^*$ (Bailey and López de Prado, 2012):
+
+$$\mathrm{PSR}(SR^*) = \Phi\left( \frac{(\widehat{SR} - SR^*)\sqrt{T-1}}{\sqrt{1 - \hat\gamma_3 \widehat{SR} + \frac{\hat\gamma_4 - 1}{4}\widehat{SR}^2}} \right)$$
+
+**DSR hurdle** (Bailey and López de Prado, 2014), with $\gamma \approx 0.5772$ the Euler–Mascheroni constant:
+
+$$SR^* = \sqrt{V}\left( (1-\gamma)\,\Phi^{-1}\!\left(1 - \tfrac{1}{N}\right) + \gamma\,\Phi^{-1}\!\left(1 - \tfrac{1}{N e}\right) \right) \quad (N \ge 2), \qquad SR^* = 0 \quad (N = 1)$$
+
+**Variance of trial Sharpe ratios (BGL's choice, not the paper's):**
+
+$$V = \max\left(\hat V,\ \frac{1}{T-1}\right)$$
+
+- $\hat V$ is the sample variance of $\widehat{SR}$ across every recorded design variant with a series, and $T$ is the selected variant's length.
+- With fewer than two recorded variants, $V = 1/(T-1)$.
+- *Reason:* $1/(T-1)$ is about the sampling variance of a Sharpe estimate for an unskilled, independent trial. Prior trials have no Sharpe ratios, so $\hat V$ cannot see them. The floor keeps the hurdle from collapsing when the recorded trials are near-copies, and it is conservative in the same way as using raw N.
+
+**DSR** $= \mathrm{PSR}(SR^*)$, computed on the selected design variant (the one named by the confirmatory run's `selects`), over its design series. *Reason for keeping the paper's approximation:* it stays within about 0.05 of the exact expected maximum for every N, and agreeing with the published DSR matters more than that error.
+
+**MinTRL** (reported, no verdict). With $z_\alpha = \Phi^{-1}(\text{dsr\_threshold})$:
+
+$$\mathrm{MinTRL} = 1 + \left[1 - \hat\gamma_3\widehat{SR} + \tfrac{\hat\gamma_4 - 1}{4}\widehat{SR}^2\right]\left(\frac{z_\alpha}{\widehat{SR} - SR^*}\right)^2$$
+
+It is reported as "not reachable" when $\widehat{SR} \le SR^*$. *Reason:* with the same hurdle and confidence, $T \ge \mathrm{MinTRL}$ exactly when DSR passes, so it adds no separate verdict.
+
+**PBO** by combinatorially symmetric cross-validation (Bailey et al., 2017).
+
+- **The matrix.** One column per recorded design variant with a series, over the common date range all of them cover. Variants outside the common range are listed and excluded from PBO, but stay in N.
+- **Blocks.** Split the rows into $S$ equal blocks. $S$ is `cscv_blocks`, or the largest even $S \ge 4$ for which every block holds at least `min_block_periods` periods.
+- **Splits.** For each way of choosing $S/2$ blocks as in-sample, find the variant with the best in-sample Sharpe. Let $\omega$ be its out-of-sample rank divided by (number of variants + 1), and $\lambda = \ln\frac{\omega}{1-\omega}$.
+- **PBO** is the share of splits with $\lambda \le 0$.
+- **Also reported:** performance degradation and probability of loss, from the same splits.
+- **Not computable** with fewer than `pbo_min_trials` variants, or when no even $S \ge 4$ fits. Stage 2 then fails.
+- *Speed note:* compute each block's sums once, so each split's Sharpe comes from block sums.
+
+**Holdout PSR.** $\mathrm{PSR}(0)$ on the confirmatory holdout run's net excess series.
+
+**Autocorrelation (reported only).** Lo's (2002) autocorrelation-adjusted annualised Sharpe ratio, for the selected variant and the holdout run. Confirm the exact form and the lag truncation against Lo (2002) before building.
+
+**Bootstrap band (stage 4, reported only).** A stationary bootstrap (Politis and Romano, 1994) of the selected variant's design series, with mean block length chosen automatically (Politis and White, 2004, with the Patton, Politis and White, 2009 correction). It uses 10,000 replications and a seed taken from the study's lock hash, and gives a two-sided 95% band for a live Sharpe of the incubation's length.
+
+**Effective N.** Trials are rarely independent, so raw N overstates the effective number. v0.1 reports raw N as the primary figure. A clustering-based effective N may be added later, as a labelled sensitivity check only. Also read before building: Harvey and Liu (2015) on Sharpe ratio haircuts.
+
+## Deployment gate (`bgl gate STUDY`)
+
+The gate answers one question: may this study's strategy be deployed with real money? It refuses a study without a `[gate]` table, with a clear message.
+
+**Order and verdict.** The verdict is the first failing stage, and nothing later can change it.
+
+- Stage 1 failing halts the gate before any statistic is computed.
+- Stages 2 and 3 both run and are both reported.
+- Stage 4 is evaluated only when stages 1 to 3 all pass.
+
+*Reason for the order:* if governance fails, the statistics are computed on a record that may be incomplete, so their numbers are not evidence.
+
+**Grade.** A passing verdict is *deployment-grade* only if G1 and G2 reach their top levels. Otherwise it is *pass, not deployment-grade*, with every reason listed.
 
 **Stage 1: Governance**
 
-- **G1. Pre-registered.** A `gate_spec` row exists in the ledger, written before the study's first counted open, and its threshold hash matches the thresholds in `bgl.toml`. *Reason:* the thresholds are the bar. If they can move after results are known, the gate can be passed by moving the bar. Stage 1 reports one of two pass levels:
-  - **Ledger-ordered:** the row exists and the chain verifies. This proves order, not date. It passes the gate but is labelled *not deployment-grade*.
-  - **Externally anchored:** the row exists, and the ledger head hash recorded just after it has been stamped with OpenTimestamps. The stamp's proof must verify against a Bitcoin attestation, and the stamped hash must still appear in the chain at the `gate_spec` row's position. *Reason:* a new stamp is pending until a Bitcoin block confirms it, so the proof must be upgraded before it counts. A deployment verdict requires this level.
-
-  *Procedure, by hand until v0.3:* write the `gate_spec` row; record the head hash in a text file; stamp that file; commit the ledger, the text file and the proof; push the commit. *Reason for the push:* it keeps a copy outside the machine. GitHub history can be force-pushed, so the stamp carries the weight and the push is a backup.
-- **G2. Every run closed.** No open row without a close row, no `late_close`, and no unclosed or in-progress run. *Reason:* a run still open may hold an outcome the researcher has not reported.
-- **G3. Holdout opened once.** Enforced at run start: `start_run` refuses a second holdout run. The only exception is one bug rerun after a crash that exposed nothing, and when in doubt the run is refused. At gate time, G3 checks the record: count the holdout runs that exposed holdout-derived output, voided runs included. Holdout-derived output is anything printed, logged or written to a file after the holdout load. The count must be one or fewer. A voided run counts unless its manifest proves no exposure: it crashed before producing any output, nothing appears in its captured stdout or stderr after the holdout load, and it has no output artifacts. Where that proof is missing, the run counts. A counted void rerun is reported as diagnostic only, and G3 fails with "holdout opened twice". An uncounted crash allows one bug rerun, and G3 passes with a note. *Reason:* a holdout is a test only if it is looked at once, and any output a researcher could read counts as a look.
-- **G4. Trial count consistent.** Recount trials from the ledger: counted runs, voided runs, and `prior_trials` from config. The N used in stage 2 must equal this recount. *Reason:* the count is the reason the gate exists, so stage 2 must use exactly the number the ledger shows.
+- **G1. Locked in time.** A lock row exists before every counted open of the study, in every chain, and the current config equals the locked values plus amendments.
+  - A gate table added after the lock is labelled late and is never deployment-grade.
+  - Claims added after the lock cannot reach deployment-grade.
+  - Amended gate values: the original verdict comes first, with the amended result beside it.
+- **G2. Witnessed and custodied.** All of these are needed for deployment-grade:
+  - the project witnesses;
+  - every counted open and the lock row are witnessed: a Rekor entry with a verified inclusion proof, and an OpenTimestamps stamp verified against Bitcoin;
+  - every head in every Rekor entry made with a registered writer's key is still in that writer's chain (no discarded or rewritten heads);
+  - the study has a holdout and a custodian;
+  - the custodian's person ran none of the study's design runs.
+  
+  The report gives the split provenance, the Rekor instance used, and the source used to check the stamps. If any of these fails, G2 passes at the *ledger-ordered* level, which is not deployment-grade.
+- **G3. Every run closed.** No unclosed or in-progress run. Every late close is acknowledged by an `ack` row.
+- **G4. Holdout looked at once.** Across all chains, at most one holdout run exposed holdout-derived output, voided runs included, unless the record proves no exposure (R6). Holdout runs were made by the custodian when one is declared. A second exposure fails G4 with "holdout opened twice".
+- **G5. Cross-chain recount.** Over the union of all registered chains:
+  - every registered chain is present, verifies, and has rows from one machine;
+  - every `other_heads` hash appears in its chain;
+  - counted opens are within budget plus amendments;
+  - each claim was decided by at most one confirmatory run;
+  - no counted duplicates exist (R4 facts).
+  
+  The N used in stage 2 is the N computed here, and the report shows its breakdown.
 
 **Stage 2: Statistical evidence**
 
-- **G5. Deflated Sharpe ratio.** Compute DSR with N from G4 and the variance of trial Sharpe ratios from recorded trials. Pass if DSR is at least the threshold. All Sharpe ratios are per-period (the formula's T is a count of periods). Annualised figures are for display only. *Reason:* the formula needs its Sharpe and its T in the same units, or the result is wrong by roughly the square root of periods per year.
-- **G6. Probability of backtest overfitting (CSCV).** Build a matrix with one column per recorded trial and one row per period, over one common date range. Split the rows into S equal blocks. S defaults to 16, is declared before the lock, and must be even. Each block must hold at least a declared minimum number of periods. If the sample is too short for that, use the largest even S that meets it. The report shows S and the block length. S is never chosen after seeing results. For each way of choosing half the blocks as in-sample, take the trial with the best in-sample Sharpe and record its rank out of sample. PBO is the share of splits where that trial falls below the out-of-sample median. Pass if PBO is at most the threshold. *Reason:* DSR asks whether a result is large enough given N. PBO asks whether picking the best in-sample trial tends to pick a loser out of sample. It assumes nothing about the return distribution, but it depends on the S chosen and on the trial set. Trials without a return series (`prior_trials`) cannot enter the matrix, so the output states that PBO covers recorded trials only. The gate report then names DSR as the check that still covers those trials, since N includes all of them, so the overfitting penalty still applies to them, just not through PBO. Counted runs with no series, such as abandoned runs, are listed as "missing from PBO" and never dropped silently. Where the series files are not on the machine running the gate, PBO is reported as not checkable, and stage 2 cannot pass.
-- **G7. Minimum track record.** Compute the minimum track record length for the observed Sharpe to beat the hurdle at the chosen confidence level. Pass if the design sample is at least that long. *Reason:* a high Sharpe over a short sample is weak evidence, even when DSR is high.
+- **G6. Deflated Sharpe ratio.** DSR of the selected design variant is at least `dsr_threshold`.
+- **G7. Holdout.** In a study with a holdout, $\mathrm{PSR}(0)$ on the confirmatory holdout run is at least `psr_threshold`.
+- **G8. Probability of backtest overfitting.** PBO is computable and at most `pbo_threshold`. Prior trials and series outside the common range cannot enter the matrix. The report says PBO covers recorded variants only, and names DSR as the check that covers the rest. Counted runs without a series are listed as "missing from PBO", never dropped silently. On a machine without the series files, PBO is not checkable and stage 2 cannot pass.
+
+The report also gives the raw and annualised Sharpe ratios, $SR^*$, $V$ (and whether the floor applied), N, MinTRL, the Lo-adjusted Sharpe, and PBO's companion measures.
 
 **Stage 3: Implementability**
 
-- **G8. Survives costs.** The net-of-cost Sharpe, using the cost model in the open manifest, is at least the threshold. The cost model must be declared and cited. It may be a flat per-trade cost or spread-plus-commission. A spread comes from a cited estimator, such as Corwin and Schultz (2012) or Abdi and Ranaldo (2017). *Reason:* the gate can check only what is declared.
-- **G9. Survives slippage.** The net Sharpe at 2x the declared costs is at least the threshold. The gate always reports this result, whatever cost model was declared. *Reason:* any cost model is a guess, and a result that holds only at the guessed cost is fragile.
-- **G10. Capacity.** Using the declared capital and the average daily volume from declared inputs, the largest position stays within the declared participation limit, which must cite its source. *Reason:* a result that works at a small size may not work at the size the fund would trade.
+- **G9. Cost model consistent.** Every counted run's manifest holds the locked cost model. A mismatch fails G9.
+- **G10. Survives double costs.** G6 and G7, recomputed with every series' cost doubled, both still pass.
+
+The report states that the cost model is an assumption: BGL applied it, but whether it is realistic is for the reviewer. Capacity is on the reviewer checklist.
 
 **Stage 4: Incubation**
 
-- **G11. Frozen and recorded.** Incubation starts with an `incubation` row, written before the first live period. It records the start date, the commit (which must equal the confirmatory runs' commit), and the pass rule with its numbers. Each live period's return is written as a `live_return` row. Any change to code during incubation ends it and starts a new one.
-- **G12. Pass rule.** Incubation cannot close before its declared minimum calendar length. MinTRL is computed on live periods and reported with the result. If live length is below MinTRL, stage 4 can only return "consistent with backtest, underpowered", never a plain pass. *Reason:* for realistic Sharpe ratios MinTRL is often years, so a MinTRL-only rule would never close, and a calendar-only rule would claim power it does not have. At close, live returns are compared with the backtest distribution. A stationary (block) bootstrap of the backtest series gives a two-sided 95% band on the live Sharpe, which keeps autocorrelation. Outcomes: *pass (consistent with backtest)* inside the band; *fail (below band)*, meaning the backtest overstated the edge; *flagged (above band)*, a possible bug or leak, for review; or *consistent with backtest, underpowered* when live length is below MinTRL. Each outcome is recorded with its label.
+- **G11. Incubation recorded.**
+  - An `incubation` row names the confirmatory run's commit, written by the custodian (or the researcher in solo mode).
+  - Each live period has a `live_return` row whose OpenTimestamps block time is at most `live_witness_lag_days` calendar days after the end of the period.
+  - Each `live_return` row lists the live input files the live system recorded for that period, with their hashes.
+  - A `live_return` row carrying a different commit ends the incubation, and a new one must start.
+  - The incubation lasts at least `min_live_days` calendar days.
+- **G12. Positions replay exactly.** The custodian's replay run uses the incubation commit, with `sample = live`, and declares the recorded live input files as its inputs. Their hashes must equal those in the `live_return` rows. For every live period, the replay's position hash must equal the live row's position hash. Any mismatch fails G12, and the report lists the periods that differ. *Reason:* both sides compute positions from the same recorded inputs with the same code, so an honest live system matches exactly, and no tolerance is needed for a bug to hide in.
+- **G13. Live costs within the tested range** (implementation shortfall; Perold, 1988). Over the incubation, the realised trading costs declared in the `live_return` rows must be at most twice the costs the locked model gives for the live turnover:
+
+  $$\sum_t \kappa_t \le 2 \sum_t \tau_t\, c$$
+
+  where $\kappa_t$ is the realised cost in period $t$, $\tau_t$ the live turnover and $c$ the locked cost per unit of turnover. When the model gives zero cost, realised costs must also be zero. *Reason:* G10 showed the strategy survives at twice the modelled cost, so live costs inside that range keep the backtest evidence valid. Realised costs and turnover are declared by the live system.
+- **G14. Live evidence reported.** The live Sharpe, its position against the bootstrap band, and MinTRL on live periods. No verdict. *Reason:* over a few months, the band has almost no power to fail a strategy whose edge was overstated.
+
+**Comparisons.** Every gate comparison is inclusive exactly as written:
+
+- DSR, holdout PSR and the double-cost checks pass at or above their threshold ($\ge$).
+- PBO passes at or below its bar ($\le$).
+- Position hashes must be equal; there is no tolerance.
+- Live costs pass at or below twice the modelled costs ($\le$).
+- Incubation passes at or after `min_live_days` ($\ge$).
+- Live rows pass when their block time is at or before the lag limit ($\le$).
+
+Each comparison has a test at its exact boundary.
 
 **Output rules**
 
-1. Each stage reports PASS or FAIL, the reason, and the numbers behind it. Nothing else.
-2. No blended score. One number would hide which stage failed, and the failing stage is the most useful thing a reviewer can see.
-3. Stage 3 says that the cost and capacity models are assumptions. The gate checks that they were applied, not that they are right. That judgement belongs to the reviewer.
-4. The result is written as a `gate` row, with the report file hashed in it. As elsewhere in the ledger, numbers are stored as strings.
-5. The original verdict always comes first. Any result under amended thresholds is labelled as amended and shown beside it, never in its place.
-6. A stage that runs after an earlier stage has already failed is labelled "diagnostic, verdict already fixed". It is shown for information and cannot change the verdict.
-
-**Thresholds.** Each study's thresholds sit in `bgl.toml`: the DSR threshold (0.95), the PBO threshold, S and the minimum periods per block, the minimum track record confidence (95%), the minimum live calendar length, the cost and slippage parameters, the participation limit, capital, and the incubation rule's numbers. C10 and C11 validate them. Every literature-based value carries its citation in config. The DSR and MinTRL values follow the literature conventions. No PBO bar is set until it is verified in Bailey et al. (2017). If that paper gives no explicit cut-off, the bar is a declared value, and its reasoning is written down beside it. Thresholds are recorded in a `gate_spec` row before the study's first counted open (G1). A study whose thresholds are locked after its first counted run must log a `deviation` row giving the reason; the gate report shows it. In-place changes after the lock are refused. The gate always evaluates the locked thresholds, and that verdict is the study's verdict. If a threshold is genuinely wrong (a typo, or a bug in the cost model), it can be amended only through a `deviation` row that gives the reason and names the fix commit. The gate report then shows a second result under the amended thresholds, clearly labelled, beside the original verdict and never replacing it. *Reason:* otherwise a threshold becomes a dial that can be turned after seeing the result.
+1. Each stage reports PASS or FAIL, the reason and the numbers behind it. The verdict carries its grade.
+2. No blended score. One number would hide which stage failed.
+3. Every declared value in the report is labelled declared.
+4. The result is written as a `gate` row, with the report file's hash. Numbers in rows are strings.
+5. The original verdict always comes first. A result under amended values is labelled amended and shown beside it, never in its place.
+6. A stage that runs after an earlier failure is labelled "diagnostic, verdict already fixed".
 
 **Data each stage reads**
 
-| Stage | Reads | Status |
-| --- | --- | --- |
-| 1 | Ledger rows (open, close, void, refused), `gate_spec`, the holdout sample | Recorded in v0.1, except `gate_spec` (new in v0.2, written before first open) |
-| 2 | Counted run IDs, the return series files (checked against `returns_sha256`), trial Sharpe ratios, `prior_trials`, S and thresholds | `returns_sha256` and the sample dates are v0.1 schema changes |
-| 3 | `costs` in the open manifest; capital, sensitivity multiplier and participation limit in config; ADV as a declared, hashed input | `costs` is a v0.1 schema change; the rest is config and existing inputs |
-| 4 | `incubation` and `live_return` rows; the backtest distribution from stage 2 | New in v0.2 |
+| Stage | Reads |
+| --- | --- |
+| 1 | Every chain's rows, lock and amend rows, Rekor entries and proofs, OpenTimestamps proofs, the config |
+| 2 | Return series files (checked against their hashes), the risk-free file, the locked costs, N from G5, the thresholds |
+| 3 | Each counted run's manifest `costs`, the return series at double cost |
+| 4 | `incubation` and `live_return` rows and their stamps, the replay run's position hashes, the locked cost model, the design series for the band |
 
-**Build.** The gate is built only after v0.1 has been used on real equities runs, and those runs are its first test case. *Reason:* a gate designed before real use tends to test the rules we imagined, not the ones the work needs.
+## v0.2: GUI
 
-**Implementation note.** The statistics are written in the package using only the standard library. `statistics.NormalDist` provides the normal distribution function and its inverse. Independent packages are test-only cross-checks, never runtime dependencies.
+The GUI is a **read-only local web page** (`bgl ui`, served on localhost), not a desktop app. *Reason:* a browser page needs no installer and works on every operating system.
 
-## v0.3: external proof of when a spec was fixed
-
-v0.3 lets a study prove, with a timestamp the researcher cannot edit, that its spec existed before its results. Git dates are set by the researcher's own machine and can be rewritten, so they show order but not time. v0.3 also automates the anchoring step that the v0.2 gate's stage 1 uses by hand (see G1).
-
-1. `register STUDY --files ...` bundles the named spec files, their SHA-256 hashes, the commit ID and the ledger's head hash into one archive, and records a `registration` row in the ledger. *Reason for the head hash:* it pins the ledger's state at that moment, so trailing rows cannot be deleted afterwards without breaking the registration. This closes the truncation gap from Scope.
-2. The researcher uploads the bundle to OSF (the Open Science Framework, osf.io), which freezes it with its own timestamp. Registrations can be embargoed (kept private) for a set period before becoming public. The OSF link and identifier are then recorded with a `note` row.
-3. **Rule:** a confirmatory run is refused unless its study has a registration recorded after the study's last change to its spec files. *Reason:* this is the point at which proof of timing matters most.
-
-**Decided 18/11/26:** OpenTimestamps is automated, and is the anchor method already used in stage 1. OSF is optional, for public registration only. OpenTimestamps proves a file existed at a time, but unlike OSF, does not publish its contents.
-
-**Not in v0.3:** any judgement of whether a spec is good. The library proves when, not whether.
-
-## v0.4: GUI
-
-The GUI is a **read-only local web page** (`bgl ui` command, served on localhost), not a desktop app. *Reason:* a browser page needs no installer and works on every operating system, and the React experience already exists; a desktop wrapper (for example Tauri) can be added later if there is a need.
-
-**Read-only by design:** runs are only created by scripts, so the GUI can never be used to make or edit a run.
+**Read-only by design:** runs are only created by scripts, so the GUI can never make or edit a run.
 
 **Views**
 
-1. **Project overview:** studies, budget used and left, claims decided and open, ledger status (verified or broken), and the count of unclosed runs.
-2. **Run list:** filterable by study, type and status. Refused, crashed, interrupted, abandoned and unclosed runs are shown, not hidden.
-3. **Run detail:** prediction next to result, commit (linked to the repository), inputs and their hashes, environment, notes, and files opened that were not declared.
-4. **Timeline:** every run of a study on one time axis, as a bar from its open row to its close row. Registrations and confirmatory runs are marked, so a reviewer sees at a glance whether rules came before results.
-5. **Statistics (with v0.2):** each strategy's Sharpe next to its deflated Sharpe and the N it used.
-6. **Society view:** several project folders side by side, for team leads reviewing many projects.
+1. **Project overview:** studies, budget, N, claims, chain and witness status, unclosed runs.
+2. **Run list:** filterable by study, type, status and chain. Refused, crashed, interrupted, abandoned, invalid and unclosed runs are shown, not hidden.
+3. **Run detail:** prediction next to result, commit, inputs and their hashes, environment, notes, files opened that were not declared.
+4. **Timeline:** every run of a study on one time axis. The lock, amendments, the seal and the holdout run are marked, with each open's witness time beside its self-reported time.
+5. **Gate report:** each stage with its numbers, the grade, and every declared value labelled.
+6. **Multi-project view:** several projects side by side, for reviewers.
 
-**Built on:** a small local API from the library (Python) and a static front end. The front end reads only what the command line can already show, so the GUI adds no new rules to test.
+**Built on:** a small local API from the library and a static front end that shows only what the command line can already show, so the GUI adds no new rules to test.
 
-## Using it across QuantSoc
+## Using it in a team
 
-The library works for one researcher alone and for a team sharing a repository, with no server.
-
-- **Several researchers, one repository:** each row records the git user. **Decided 18/11/26: one chain per researcher.** Each researcher appends only to their own chain file, named by their registered chain code. Chains never merge, so git cannot reorder or break rows. The gate counts trials across every registered chain and counts each run ID once. It fails if a registered chain is missing, so leaving a chain out cannot lower N. *Reason:* a single merged chain gives git a way to reorder rows silently.
-- **Who the user is:** the `user` field is self-reported. For review, the stronger evidence is a verified commit signature (`signature` in the open manifest). Git supports SSH or GPG signing, and GitHub verifies signatures, so a good signature ties a run to a key that someone controls. An unsigned or unverified run is still recorded, but reviewers should treat its author as unknown. Confirmatory runs must be signed from v0.3. Both SSH and GPG signing are accepted, since SSH keys are easier for members to set up.
-- **Head hash practice:** each researcher records the ledger head hash from `bgl status` in the commit message of the ledger commit, or in the team channel. This is the v0.1 defence against truncation (see Scope).
-- **Review before money:** a reviewer runs `verify` and `status`, opens the GUI timeline, and checks that every confirmatory run came after its registration. A one-page review checklist ships with the library. Its items include: every void has a fix commit that plausibly fixes the stated bug.
-- **Adoption cost:** `pip install` (or `uv add`), `init`, and five lines per script. Projects that already have a log can import it with `migrate`, honestly marked as unverified.
-- **Licensed data:** only hashes and paths of data files are stored, never the files, so projects using CRSP, Compustat or IVolatility can be shared without breaching their terms.
-- **Teaching use:** the run budget and prediction rules are a practical way to teach new members why backtests overfit.
+- **Writers:** each person on each machine is a registered writer with their own chain and key.
+- **Custodian:** a person who is not a researcher on the study. They hold the holdout files, seal them, run the confirmatory holdout run, and run incubation and the replay.
+- **Review before money:** a reviewer runs `verify` and `gate`, and works through the reviewer checklist, which ships with the library. Its items include:
+  - each declared variant count matches the recorded code;
+  - the split script uses no holdout-period information to build the design outputs;
+  - the live system records its input files each period and computes position hashes with `position_hash`;
+  - every void has a fix commit that plausibly fixes the stated bug;
+  - the cost model and return basis are realistic;
+  - capacity: the strategy can trade at the intended size.
+- **Adoption cost:** install, `init` or `join`, the config, and about ten lines per script. Projects with an old log import it with `migrate`, marked as unverified.
+- **Licensed data:** only hashes and paths of data files are committed, so projects using licensed data can share their repository without breaching their terms.
+- **Teaching use:** the budget, prediction and holdout rules are a practical way to teach why backtests overfit.
 
 ## Testing, packaging and quality
 
@@ -487,128 +1054,161 @@ A library that certifies other people's honesty has to be held to a higher stand
 
 **Testing**
 
-- **One test per rule (R1 to R16),** written first and seen to fail before the rule is implemented.
-- **Real git in tests:** each test builds a temporary repository, so the clean-code check is tested against git itself, not a mock.
-- **Tamper tests:** edit a byte of an old row, delete a row, swap two rows, delete a manifest, edit a close file; `verify` must catch each.
-- **Truncation test:** delete trailing rows; `verify` passes, but the head hash recorded earlier no longer matches. The test documents the limit rather than hiding it.
-- **Crash tests:** an exception, a Ctrl+C and a missing result each produce the right status and still use budget.
-- **Hard-kill test:** start a run in a separate process, then kill it (`kill -9` on Linux and macOS, `TerminateProcess` on Windows) between open and close. `verify` must fail the run as unclosed, and `abandon` must clear it.
-- **Live-run test:** a separate process still running between open and close holds its lock. `verify` must report it in progress, not fail it.
-- **Lock test after death:** once the live process is killed, its lock must be free, so the same run is then reported as unclosed.
-- **Synced-folder test:** `init` inside a path under a known synced folder must print the warning.
-- **Other-machine test:** a run whose `host` differs from this machine must make `verify` say it cannot tell, and fail.
-- **Abandon refusal test:** `abandon` on a run whose lock is held here must be refused.
-- **Cross-machine abandon test:** `abandon` for a run whose `host` differs must be refused without `--force`. If the original run later closes, its close is written as `late_close` and `verify` flags it.
-- **Ledger concurrency test (R18):** two processes append to one ledger at the same moment, many times over. No row may be lost, and `verify` must pass with every row chained onto a single head.
-- **Refusal message test (R3b):** the refusal names each untracked file and both fixes, in the form given in R3b.
-- **Scratch folder test:** `init` creates `scratch/`, adds it to `.gitignore` without duplicating or overwriting existing entries, and a scratch file that a run imports closes the run as `invalid`.
-- **Untracked-code tests (R3b and R17):** an untracked, non-ignored `.py` file in the repository must refuse the run before any user code runs. A git-ignored `.py` file that is imported must close the run as `invalid`. An untracked file outside the repository must not trigger either check.
-- **Clean-tree test (R3):** after one run, the ledger and `runs_dir` are dirty, and the next run must still start. A dirty tracked script must refuse.
-- **Void tests (R6):** a `void` on a crashed confirmatory run frees one more run for its claim. A void without a fix commit must be refused, and so must a fix commit that predates the voided run or changes no tracked code. A second void on the same claim must be refused, and a rerun cannot be voided. A `void` on an `ok` run must be refused. A voided run still counts against the budget.
-- **Legacy ID test:** an imported row with ID `R01` must pass the ID check and keep its `counts` value.
-- **Canonical hash test:** a fixed row with a known hash, including a non-ASCII value, must produce that exact hash on Linux, macOS and Windows.
-- **Crash at close:** kill between the close file and the close row. `verify` must report the orphan file.
-- **Audit-hook test:** a script that opens an undeclared file through Python must appear in `files_opened`. A pyarrow read is tested separately and its result recorded, whichever way it goes.
-- **Signature test:** a good, bad, unsigned and unknown-key commit each produce the right `signature` value.
-- **Property tests** (the Hypothesis library) for the hash chain: any sequence of valid appends verifies; any single change to any row fails.
-- **Cross-platform:** CI runs the hard-kill and live-run tests on Linux, macOS and Windows. The Windows lock (`msvcrt.locking`) behaves differently from `fcntl.flock`, so a Windows failure is a blocker, not a skip.
+- **One test per rule:** every R, C and G rule in the canonical lists, written first and seen to fail before the rule is implemented.
+- **Real git in tests:** each test builds a temporary repository.
+- **No network in tests:** a local fake implementing Rekor's API stands in for Rekor, and OpenTimestamps is tested with fixed proof files.
+- **Tamper tests:** edit a byte of an old row, delete a row, swap two rows, re-sign a row with another key, delete a manifest, edit a close file or a return series. `verify` must catch each.
+- **Rebuild test:** rebuild a chain with valid hashes and signatures after one of its heads has been pushed and stamped. `verify --contains` and the gate must catch it.
+- **Torn-tail test:** a partial final line refuses every append until `repair`, which records the removed bytes.
+- **Crash tests:** an exception, a Ctrl+C and a missing result each give the right status and still use budget.
+- **Hard-kill, live-run and lock-after-death tests,** on Linux, macOS and Windows.
+- **Other-machine test:** a run with a different machine ID makes `verify` say it cannot tell, and fail. A chain with two machine IDs fails.
+- **Abandon tests:** refused while the lock is held here; refused on another machine without `--force`. A later normal close is reported as a late close until acknowledged.
+- **Ledger concurrency test (R18):** two processes append at once, many times over. No row is lost and `verify` passes.
+- **Writer tests (R19):** a missing writer file, an unregistered code, and a key that does not match the registry each refuse the run.
+- **Lock tests (R22):** the first counted open writes the lock; a changed budget refuses the next open; an increase by `amend` is accepted; a decrease is refused; a change to a holdout key can never be amended.
+- **Custodian handover tests:** before sealing, any writer's amendment is accepted. After sealing, an amendment not signed by the outgoing custodian is refused. Holdout runs are refused until the reseal. A reseal whose plaintext hashes differ from the original fails `verify`. After the holdout run, the handover moves only incubation.
+- **Holdout tests (R20):**
+  - a design run declaring a holdout, restricted or tainted file is refused;
+  - a second holdout run is refused;
+  - a non-custodian holdout run is refused when a custodian is declared;
+  - a holdout file opened by a design run closes it as `invalid`.
+- **Void tests (R6):** a void with no exposure and a valid fix commit frees one rerun. A void after exposure, without a fix commit, or with a fix commit that does not descend from the run or changes no tracked code is refused. A second void on the same claims is refused.
+- **Duplicate tests (R4):** identical recorded facts refuse a counted run; one changed input hash allows it; an exploratory exact rerun is allowed.
+- **Untracked-code tests (R3b, R17):** an untracked `.py` file refuses the run. A git-ignored module imported above the `with` block refuses it at open. One imported inside the block closes it as `invalid`.
+- **Witness tests:** offline submission failures leave the run unwitnessed but complete. `witness` retries succeed against the fake log. An entry whose head is missing from the chain fails G2. An inclusion proof that does not verify fails.
+- **Signature tests:** a good, bad, unsigned and unknown-key commit each give the right `commit_signature` value.
+- **Canonical hash test:** a fixed row with a known hash, including a non-ASCII value and a decimal stored as its canonical string, gives that exact hash on all three operating systems.
+- **Series tests:** the same series written twice gives the same bytes on all three operating systems. A series off the study grid, or with the wrong variant count, is refused.
+- **Dry-run tests (R25):** fixtures replace inputs; a Python open of a non-fixture data file is blocked; a `dry` row is written; no budget is used.
+- **Audit-hook spike result:** a pyarrow read is tested and its result recorded, whichever way it goes.
+- **Property tests** (Hypothesis): any sequence of valid appends verifies, and any single change to any row fails.
 
-**Gate tests (v0.2)**
+**Statistics and gate tests**
 
-- **One test per gate rule (G1 to G12),** written first and seen to fail first, on fixed ledgers built in temporary repositories.
-- **Stage order test:** a stage 1 failure computes no statistic. A stage 2 failure still runs stage 3, and the verdict stays at stage 2. Stage 4 does not start unless stages 1 to 3 all pass.
-- **Cross-check tests:** DSR against quantstrat on known cases; PBO against an independent implementation on one fixed matrix. Results must agree within a stated tolerance, and a disagreement fails the build.
-- **Threshold lock test:** an in-place change to a locked threshold is refused, and the verdict still uses the locked values. An amendment by `deviation` row without a fix commit is refused. With a fix commit, the report shows the amended result beside the original, and the original verdict is unchanged.
-- **Units test:** a DSR input given annualised returns must be refused or converted, never mixed silently.
-- **Holdout tests:** a second holdout run that exposed output fails G3 with "holdout opened twice". A crashed holdout run with no output after the load allows one rerun, and G3 passes with a note. A crashed run whose proof is missing counts.
-- **Migration test:** every imported row keeps the study its source log gives it. A row must never be imported under a study other than its source's.
-- **Late-lock test:** a study whose thresholds are locked after its first counted run needs a `deviation` row, and the gate report shows it.
-- **Series determinism test:** the same series written twice gives the same bytes and the same hash, on Linux, macOS and Windows.
-- **Prior-trial scope test:** `prior_trials` declared on one study adds to that study's N only. Another study's N does not change. The gate report names DSR as the check covering prior trials, and says PBO excludes them.
-- **Missing-series test:** an abandoned counted run appears in the gate report as "missing from PBO". A machine without the series files reports PBO as not checkable, and stage 2 does not pass.
-- **Block-length test:** S falls to the largest even value that meets the minimum block length, and the report shows S and the block length.
-- **Band test:** an above-band live result is flagged, a below-band one fails, an in-band one passes, and live length below MinTRL returns only the underpowered label.
-- **Chain-registry test:** a missing registered chain fails trial counting, and a run ID found in two chains is counted once.
+- **Fixed vectors:**
+  - DSR and PSR against the DSR paper's worked example (verify the numbers against the paper first);
+  - hand-computed cases with stated derivations;
+  - PBO against a hand-computed $S = 4$ matrix (6 splits);
+  - the approximate hurdle against the exact expected maximum of N standard normals, within a stated tolerance.
+- **Property tests:** DSR never rises as N grows with everything else fixed; N = 1 gives PSR against zero; the variance floor applies when the recorded variants are identical.
+- **One test per gate rule** on fixed ledgers in temporary repositories.
+- **Boundary tests:** every threshold comparison is tested at exactly the threshold, and just either side of it.
+- **Stage order test:** a stage 1 failure computes no statistic. A stage 2 failure still runs stage 3, and the verdict stays at stage 2.
+- **Grade tests:** a solo study with no custodian, a study with `holdout = false`, a late gate table, and an unwitnessed counted open each give a pass that is not deployment-grade.
+- **Cost tests:** BGL's net series equals gross minus turnover times the cost minus the risk-free return. Doubling the cost can turn a pass into a G10 failure.
+- **Replay tests:** matching position hashes pass; one differing period fails G12 and is listed; a replay whose input hashes differ from the live rows fails; weights differing only beyond the eighth decimal place give the same hash; a `live_return` row stamped later than the lag fails G11.
+- **Live cost tests:** realised costs exactly twice the modelled costs pass; slightly more fails G13; zero modelled cost with non-zero realised cost fails.
+- **Migration tests:** imported rows decide claims and use up the holdout, but add nothing to budget or N; `prior_trials` below the imported count is refused; the import is all or nothing.
 
 **Packaging**
 
-- Python 3.11 or later, built with uv, published to PyPI under the chosen name.
-- Standard library only for v0.1 (json, hashlib, subprocess for git, tomllib, and `sys.addaudithook`). *Reason:* every dependency is something that can break or be compromised in a tool whose job is trust. The statistics stay in the standard library too (`statistics.NormalDist` supplies the normal distribution function and its inverse). Independent packages used to cross-check the numbers belong in the development group, never in the package. The GUI may add dependencies as an optional extra.
-- Semantic versioning. The ledger and manifest formats carry a `format_version`, and any change to them ships with a migration.
+- Python 3.11 or later, built with uv, published to PyPI as `bgl`.
+- **Dependencies:** `cryptography` (sealing and row signatures), `opentimestamps` (stamp proofs) and `numpy` (statistics). Each is named here with its reason, pinned with hashes in `uv.lock`, and checked by a dependency vulnerability audit in CI. Hash-chain verification needs only the standard library; signature and stamp checks need the pinned dependencies. `opentimestamps` is LGPL-3, which as far as I know is fine to depend on from an MIT project; check before release.
+- The GUI may add dependencies as an optional extra.
+- Semantic versioning. Every ledger row, manifest and series file carries a `format_version`, and any change to a format ships with a migration.
 
 **Quality**
 
 - Type hints throughout, checked in CI; a linter in CI.
-- Documentation: a README with the five-line quick start, a "Common refusals" section (starting with R3b: new `.py` files must be committed or put in `scratch/`), one page per command, the design rationale (this spec, kept up to date), and the head-hash practice from Scope.
-- An open-source licence (MIT suggested), so other societies can adopt it.
+- Documentation: a README with a quick start, a "Common refusals" section (starting with R3b), one page per command, the reviewer checklist, the custodian workflow, the supported git workflow, and this spec as the design rationale.
+- An open-source licence (MIT suggested).
+
+## Example project and dogfooding
+
+BGL is designed and tested on its own terms. Real projects use it; they do not shape it.
+
+**The example project** (`examples/` in the BGL repository) is a small, made-up research project that exercises every feature:
+
+- a team-mode `bgl.toml` with two researchers' writers and a custodian, a study with a holdout and gate table, and a study with `prior_trials` and no holdout;
+- a split, diagnostic grids, a sealed holdout run, a void, a sample import, witnessing against a fake Rekor log with fixed stamp proofs, incubation with a position replay and a cost check, and a full `bgl gate` run.
+
+- **Synthetic data only.** Every input is generated from a fixed random seed. *Reason:* CI never touches licensed data, and every run of the example gives the same numbers on every machine.
+- **It is the release gate.** The release is checked by running the example end to end in CI on Linux, macOS and Windows.
+- **It holds no rules.** If the example needs a special case, that is a bug in BGL.
+
+**Dogfooding.** Before release, BGL is used on at least one real project. Feedback flows one way only:
+
+1. A problem found in a real project is written up as a general BGL issue, without the project's names, data or history.
+2. The fix comes with an example-project test that fails before the fix and passes after it.
+3. No rule, default, example or test in BGL names a user project or depends on one.
 
 ## Roadmap, build order and open decisions
 
-Each version ships only when its gate is met, and regime\_consensus is the first project to use each one.
-
-| Version | Gate |
-| --- | --- |
-| v0.1 Ledger and runs | regime\_consensus migrated; `verify` passes in CI |
-| v0.2 Statistics and gate | Deflated Sharpe matches quantstrat on known cases; PBO matches an independent implementation on one fixed matrix; `bgl gate equities` runs end to end on the real study |
-| v0.3 Registration | One study registered end to end |
-| v0.4 GUI | A reviewer uses it on a real project |
+| Version | Contents | Gate |
+| --- | --- | --- |
+| v0.1 | The whole library | Every R, C and G test passes on all three operating systems; the example project runs end to end in CI; one real dogfooding pass is complete |
+| v0.2 | GUI | A reviewer completes the review checklist on the example project using only the GUI |
 
 **Build order for v0.1** (each step with its tests, seen failing first):
 
-1. **Package skeleton:** new repository, `uv init --lib`, a `.gitignore` covering `.bgl/` (locks are machine-local and never committed), CI on three operating systems, licence, README stub. Added to regime\_consensus as an editable local dependency.
-2. **Config loader:** `bgl.toml` with validation and clear errors.
-3. **Ledger:** canonical JSON (pinned as in the hash field), hash chain, head hash, the ledger lock (R18) with `fsync` and its two-process test, `verify` for the chain only. *First because everything writes to it.*
-4. **Git checks:** clean tree with BGL's own files excluded (R3), tracked script, the untracked-Python check (R3b), commit ID, user, signature status.
-5. **Run context manager:** checks R1 to R9, takes the lock, writes open row, close row, crash and interrupt handling, atomic writes, the import audit check (R17).
-6. **Audit-hook spike:** test whether `sys.addaudithook` sees pyarrow reads, and record the result. The README wording for R8 depends on it, so it comes before the README claim is written.
-7. **Manifests:** open manifest, close file, their hashes, `files_opened`.
-8. **Lock checks and the command-line tool:** the lock test on all three operating systems first, then `init` (with the synced-folder warning and the `scratch/` folder), `status`, `list`, `show`, `verify` (with unclosed-run, orphan and late-close checks), `note`, `abandon`, `void`, `migrate`.
-9. **Migrate regime\_consensus:** import `runs.csv` (rows marked `imported`), switch the scripts to `start_run`, delete the old `runlog.py`.
-10. **Gate (v0.2):** statistics first (DSR, then PBO, then minimum track record), then stages 1 to 4 in order. Built only after v0.1 has been used on real equities runs, which are the gate's first test case.
+1. **Package skeleton:** repository, `uv init --lib`, pinned dependencies, `.gitignore` covering `.bgl/`, CI on three operating systems with the dependency audit, licence, README stub.
+2. **Config loader:** C1 to C20.
+3. **Ledger:** canonical JSON, keys and signatures, the hash chain, torn-tail detection and `repair`, the ledger lock with `fsync` and its two-process test, chain verification. *First because everything writes to it.*
+4. **Git helpers:** clean tree (R3), tracked script, untracked Python (R3b), commit, user, commit signature, code fingerprint, reachability.
+5. **Audit-hook spike:** test whether `sys.addaudithook` sees pyarrow reads, and what the module scan sees. R8, R17 and R25's wording depends on the result, so it comes before the code that relies on it.
+6. **Run lifecycle:** pre-open checks, the study lock, manifests, open and close rows, crash and interrupt handling, atomic writes, output capture, `run.returns`, `run.holdout`, dry runs.
+7. **Writers and chains:** `join`, other heads, cross-chain reading, machine ID checks.
+8. **Witness:** Rekor submission, inclusion-proof checks and listing by public key; OpenTimestamps submission, upgrade, and checks against a node or two explorers.
+9. **Custodian:** `seal`, decryption for holdout runs, taint tracking.
+10. **Command-line tool:** the lock test on three operating systems first, then every command.
+11. **Statistics:** estimators, PSR, DSR, MinTRL, CSCV and PBO, the Lo adjustment, the bootstrap band, with fixed vectors.
+12. **Gate:** stages 1 to 4 in order, the report, the `gate` row.
+13. **Migrate.**
+14. **Register** (optional OSF bundle).
+15. **Example project:** end to end in CI on three operating systems, then the dogfooding pass. This is the release gate.
 
-**Open decisions** (decide and date before the step that needs them):
+Adopting BGL in a real project is that project's own task, in its own repository. It is not a BGL build step.
 
-| Decision | Options | Needed by |
-| --- | --- | --- |
-| Package name | Decided 18/11/26: BGL (Backtest Governance Library); package and import name `bgl`, free on PyPI on that date | Step 1 |
-| Run ID format | Decided 18/11/26: per-study prefix plus counter, with the researcher's chain code added for multi-chain use (see R16) | Decided |
-| Unclosed runs in `verify` | Decided 18/11/26: failure by default; cleared only by `abandon` with a written reason; a run whose lock is held on this machine is reported in progress | Decided |
-| Live runs | Decided 18/11/26: a lock file held by an OS lock, not a PID. Lock taken without waiting by `verify` | Decided |
-| Locks on synced or network folders | Decided 18/11/26: unsupported and documented; `init` warns when the project is inside a known synced folder | Decided |
-| Dry runs | Decided 18/11/26: enforced with the audit hook. The C-level reader gap is a known limitation | Decided |
-| Audit-hook scope | Decided 18/11/26: hold the R8 claim until the spike (step 6), then word it to match exactly what the hook detects | Decided |
-| Concurrent writers | Decided 18/11/26: same machine uses the ledger lock (R18). Across machines, one chain per researcher, registered in config (C12). Trial counting fails on a missing chain and counts each run ID once | Decided |
-| Signed commits | Decided 18/11/26: required for confirmatory runs from v0.3. SSH and GPG both accepted | Decided |
-| Effective number of trials | Decided 18/11/26: raw N in v0.2. Effective N later, as a labelled sensitivity check only | Decided |
-| Registration route | Decided 18/11/26: OpenTimestamps automated. OSF optional, for public registration | Decided |
-| Gate stage 1 pre-registration | Decided 18/11/26: `gate_spec` row now, plus a hand-made OpenTimestamps anchor of the head hash. Stage 1 has two pass levels (see G1). v0.3 automates the anchoring step | Decided |
-| Minimum level for deployment | Decided 18/11/26: a deployment verdict requires externally anchored. Ledger-ordered passes but is labelled not deployment-grade | Decided |
-| Late threshold lock | Decided 18/11/26: a late lock is recorded by a `deviation` row giving the reason and the runs made before the lock, shown in the gate report | Decided |
-| Changing thresholds after first open | Decided 18/11/26: in-place changes refused. The verdict always uses the locked thresholds. Errors (typo, cost-model bug) can be amended only by a `deviation` row with a fix commit, and the gate shows the amended result beside the original | Decided |
-| Stopping at a failed stage | Decided 18/11/26: the verdict is the first failure. Stage 1 failure halts all. Stages 2 and 3 both run and both are reported. Stage 4 runs only if stages 1 to 3 pass | Decided |
-| Voided holdout runs | Decided 18/11/26: a voided holdout run counts unless its manifest proves it exposed no holdout-derived output. Doubt counts (see G3) | Decided |
-| Holdout enforcement | Decided 18/11/26: start_run refuses a second holdout run. One bug rerun is allowed after a crash that exposed nothing. When in doubt, refuse | Decided |
-| Return series storage | Decided 18/11/26: one portfolio-level daily series per counted run, never per-asset, kept in a git-ignored folder with only its hash in the ledger. Owner backs it up privately. Open detail: the series may still be restricted by data licences, so check before any sharing | Decided |
-| Prior trials in PBO | Decided 18/11/26: PBO covers recorded trials only, and the gate report states the limit. DSR still counts all prior trials in N, and the report names DSR as the check covering them. The 38 V1 and V2 trials belong to the crypto study only | Decided |
-| CSCV block count S | Decided 18/11/26: S = 16 by default, declared before the lock. Each block holds a declared minimum number of periods; if the sample is too short, use the largest even S that meets it. S and block length are shown in the report | Decided |
-| Incubation pass rule | Decided 18/11/26: stationary (block) bootstrap with a two-sided 95% band. Results above the band are flagged as a possible bug or leak; results below it fail | Decided |
-| Minimum incubation length | Decided 18/11/26: a declared minimum calendar length, with MinTRL reported on live periods. Below MinTRL, stage 4 returns only "consistent with backtest, underpowered" | Decided |
-| Cost and capacity models | Decided 18/11/26: cost model declared and cited (flat, or spread-plus-commission with the spread from a cited estimator). Results at 2x costs always reported. Participation limit cited | Decided |
-| Gate threshold values | Decided 18/11/26: literature conventions, each cited in config. DSR at least 0.95; MinTRL at 95%. No PBO bar until verified in Bailey et al. (2017); if that paper gives no cut-off, a declared value with written reasoning | Decided |
-| Return series licences | Decided 18/11/26: confirm the licence before the first counted run. If a licence forbids local derived storage, the study is excluded from PBO and the report says why | Decided |
+**Decided (18 Nov 2026).** Everything in the decision batch at the top of this spec, plus these earlier decisions, which still stand:
+
+| Decision | Outcome |
+| --- | --- |
+| Package name | BGL (Backtest Governance Library); package and import name `bgl` |
+| Unclosed runs | Fail `verify`; cleared only by `abandon` with a written reason; a run whose lock is held here is in progress |
+| Live runs | A lock file held by an OS lock, not a PID |
+| Synced or network folders | Unsupported and documented; `init` warns |
+| Effective number of trials | Raw N is primary; effective N later, as a labelled sensitivity check only |
+| Stopping at a failed stage | The verdict is the first failure; stages 2 and 3 both run; stage 4 only after 1 to 3 pass |
+| Config defaults | No key has a default |
+
+**Still open, or to check before the step that needs them:**
+
+| Item | Needed by |
+| --- | --- |
+| The audit hook's view of pyarrow reads and loaded modules | Step 5 |
+| Whether Rekor's v2 API still lists entries by public key; whether it accepts Ed25519-signed hash entries; its rate limits. If listing is unavailable, use the fallback in Witness | Step 8 |
+| The OpenTimestamps calendar API and the `opentimestamps` library's verification interface | Step 8 |
+| The authenticated encryption construction for sealing (streamed, from `cryptography`) | Step 9 |
+| The DSR paper's worked example values; the exact Lo (2002) form and lag truncation; the automatic block-length method | Step 11 |
+| The licence compatibility of `opentimestamps` (LGPL-3) | Before release |
 
 ## References
 
 - Arnott, R., Harvey, C. R., and Markowitz, H. (2019). A Backtesting Protocol in the Era of Machine Learning. *Journal of Financial Data Science*, 1(1), 64 to 74.
-- Abdi, F., and Ranaldo, A. (2017). A Simple Estimation of Bid-Ask Spreads from Daily Close, High, and Low Prices. *Review of Financial Studies*, 30(12). Spread estimator for G8. *Check page numbers before citing.*
-- Corwin, S. A., and Schultz, P. (2012). A Simple Way to Estimate Bid-Ask Spreads from Daily High and Low Prices. *Journal of Finance*, 67(2). Spread estimator for G8. *Check page numbers before citing.*
-- Politis, D. N., and Romano, J. P. (1994). The Stationary Bootstrap. *Journal of the American Statistical Association*, 89(428). Resampling method for G12. *Check page numbers before citing.*
-- Bailey, D. H., and López de Prado, M. (2012). The Sharpe Ratio Efficient Frontier. *Journal of Risk*, 15(2). Source of PSR and minimum track record length (G5, G7). *Check page numbers before citing.*
-- Bailey, D. H., Borwein, J., López de Prado, M., and Zhu, Q. J. (2017). The Probability of Backtest Overfitting. *Journal of Computational Finance*, 20(4), 39 to 69. Source of CSCV and PBO (G6).
+- Bailey, D. H., and López de Prado, M. (2012). The Sharpe Ratio Efficient Frontier. *Journal of Risk*, 15(2). Source of PSR and MinTRL. *Check page numbers before citing.*
 - Bailey, D. H., and López de Prado, M. (2014). The Deflated Sharpe Ratio: Correcting for Selection Bias, Backtest Overfitting, and Non-Normality. *Journal of Portfolio Management*, 40(5), 94 to 107. [SSRN](https://papers.ssrn.com/abstract=2460551)
-- Harvey, C. R., Liu, Y., and Zhu, H. (2016). ...and the Cross-Section of Expected Returns. *Review of Financial Studies*, 29(1). Source of the multiple-testing hurdle, an optional extra check beside DSR. *Check page numbers before citing.*
+- Bailey, D. H., Borwein, J., López de Prado, M., and Zhu, Q. J. (2017). The Probability of Backtest Overfitting. *Journal of Computational Finance*, 20(4), 39 to 69. Source of CSCV and PBO. Section 3.1 of the February 2015 revision describes rejecting models whose PBO exceeds 0.05 as customary.
 - Harvey, C. R., and Liu, Y. (2015). Backtesting. *Journal of Portfolio Management*, 42(1). *From memory; check before citing.*
-- López de Prado, M. (2018). *Advances in Financial Machine Learning*. Wiley, chapter 14.
-- Python PEP 578, Python Runtime Audit Hooks, for `sys.addaudithook` in R8. *Confirm against the current Python documentation before relying on it.*
-- R quantstrat's `deflatedSharpe`, an existing implementation to test against: [documentation](https://www.rdocumentation.org/packages/quantstrat/versions/0.16.7/topics/deflatedSharpe)
-- Open Science Framework: osf.io
+- Harvey, C. R., Liu, Y., and Zhu, H. (2016). ...and the Cross-Section of Expected Returns. *Review of Financial Studies*, 29(1). *Check page numbers before citing.*
+- Lo, A. W. (2002). The Statistics of Sharpe Ratios. *Financial Analysts Journal*, 58(4). Source of the autocorrelation adjustment. *From memory; check before citing.*
+- López de Prado, M. (2018). *Advances in Financial Machine Learning*. Wiley.
+- Perold, A. F. (1988). The Implementation Shortfall: Paper versus Reality. *Journal of Portfolio Management*, 14(3). Source of the live cost check (G13). *From memory; check before citing.*
+- Patton, A., Politis, D. N., and White, H. (2009). Correction to "Automatic Block-Length Selection for the Dependent Bootstrap". *Econometric Reviews*, 28(4). *From memory; check before citing.*
+- Politis, D. N., and Romano, J. P. (1994). The Stationary Bootstrap. *Journal of the American Statistical Association*, 89(428). *Check page numbers before citing.*
+- Politis, D. N., and White, H. (2004). Automatic Block-Length Selection for the Dependent Bootstrap. *Econometric Reviews*, 23(1). *From memory; check before citing.*
+- Python PEP 578, Python Runtime Audit Hooks. The `import` audit event fires before the module name is resolved to a file, and its arguments other than the module name may be `None`, which is why R17 scans loaded modules instead.
+- OpenTimestamps: the Python client and the `opentimestamps` library.
+- Sigstore Rekor: the public transparency log used for witnessing (rekor.sigstore.dev).
+- Open Science Framework: osf.io.
+
+## Appendix A: worked example, adoption in a student trading society
+
+This appendix shows one real adoption. Nothing in it is a rule.
+
+- **Context.** A university student trading society's algorithm programme runs research projects whose strategies may be traded with the society's fund.
+- **Mode.** Fund projects use `team` mode. Personal projects may use `solo` mode, and their gate results are labelled not deployment-grade.
+- **Custodian.** The head of the society's quant division is the custodian for fund projects. When the committee changes each year, the outgoing head hands over by a signed amendment before leaving. They receive the raw data where the licence allows, run the split, seal the holdout, run each study's one holdout test, and run incubation and the replay.
+- **Reviewers.** The fund's decision makers work through the reviewer checklist before money is committed.
+- **Return series backup.** Each researcher copies `returns/` to their university cloud storage, never the project folder itself.
+- **Licensed data.** Each member holds their own data licence, so a custodian split is not always possible. Those studies report a researcher split.
