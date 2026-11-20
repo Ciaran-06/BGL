@@ -507,6 +507,18 @@ class TestCheckWholeNumber:
         assert (result == value) is ok
         assert found.has_errors() is not ok
 
+    @pytest.mark.parametrize(
+        ("value", "ok"),
+        [pytest.param(20, True, id="at_maximum"), pytest.param(21, False, id="over")],
+    )
+    def test_maximum(self, value: int, ok: bool) -> None:
+        found = new_collector()
+        result = check_whole_number(
+            found, {"n": value}, "n", "studies.alpha.gate", "C10", minimum=4, maximum=20
+        )
+        assert (result == value) is ok
+        assert found.has_errors() is not ok
+
 
 class TestCheckNumber:
     def check(self, value: Any, **bounds: float) -> tuple[float | None, ErrorCollector]:
@@ -1385,6 +1397,9 @@ class TestC10Gate:
             pytest.param("cscv_blocks = 16", "2", False, id="blocks_2"),
             pytest.param("cscv_blocks = 16", "5", False, id="blocks_odd"),
             pytest.param("cscv_blocks = 16", "16.0", False, id="blocks_float"),
+            # N37: at most 20.
+            pytest.param("cscv_blocks = 16", "20", True, id="blocks_20"),
+            pytest.param("cscv_blocks = 16", "22", False, id="blocks_22"),
             pytest.param("min_block_periods = 20", "1", True, id="block_periods_1"),
             pytest.param("min_block_periods = 20", "0", False, id="block_periods_0"),
             pytest.param("min_live_days = 90", "0", False, id="live_days_0"),

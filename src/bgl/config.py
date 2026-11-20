@@ -161,18 +161,24 @@ def check_whole_number(
     rule: str,
     *,
     minimum: int,
+    maximum: int | None = None,
     even: bool = False,
 ) -> int | None:
-    """An integer (not a boolean) of at least minimum, and even if asked."""
+    """An integer (not a boolean) from minimum to maximum, and even if asked."""
     value = table.get(key)
     if (
         isinstance(value, int)
         and not isinstance(value, bool)
         and value >= minimum
+        and (maximum is None or value <= maximum)
         and (not even or value % 2 == 0)
     ):
         return value
-    expected = f"a whole number, at least {minimum}" + (", and even" if even else "")
+    expected = (
+        f"a whole number, at least {minimum}"
+        + ("" if maximum is None else f" and at most {maximum}")
+        + (", and even" if even else "")
+    )
     collector.add(rule, expected, key=key_path(table_path, key), found=value)
     return None
 
@@ -1291,8 +1297,17 @@ def check_gate(
     pbo_min_trials = check_whole_number(
         collector, gate, "pbo_min_trials", gate_path, "C10", minimum=2
     )
+    # [DECISION] N37 cscv_blocks is at most 20 (C(20, 10) = 184,756 splits),
+    # so the CSCV pass stays affordable. Spec text pending approval.
     cscv_blocks = check_whole_number(
-        collector, gate, "cscv_blocks", gate_path, "C10", minimum=4, even=True
+        collector,
+        gate,
+        "cscv_blocks",
+        gate_path,
+        "C10",
+        minimum=4,
+        maximum=20,
+        even=True,
     )
     min_block_periods = check_whole_number(
         collector, gate, "min_block_periods", gate_path, "C10", minimum=1
