@@ -112,6 +112,18 @@ def uncommitted_changes(root: Path, exempt: Sequence[str]) -> list[str]:
     """
     _check_exempt(exempt)
     output = run_git(root, "status", "--porcelain=v1", "-z", "--untracked-files=no")
+    changed = _porcelain_paths(output)
+    return sorted(path for path in changed if not _exempt(path, exempt))
+
+
+def _porcelain_paths(output: bytes) -> set[str]:
+    """Every path named by `git status --porcelain=v1 -z` output.
+
+    Each record is "XY path". A rename or copy (R or C in either column) is
+    followed by one more NUL-separated field, the original path, which is
+    listed too. Reading that field as a record would cut its first three
+    characters off.
+    """
     records = _split_z(output)
     changed: set[str] = set()
     index = 0
@@ -119,11 +131,11 @@ def uncommitted_changes(root: Path, exempt: Sequence[str]) -> list[str]:
         record = records[index]
         status, path = record[:2], record[3:]
         changed.add(path)
-        if "R" in status or "C" in status:
+        if ("R" in status or "C" in status) and index + 1 < len(records):
             index += 1
             changed.add(records[index])  # the original path of a rename or copy
         index += 1
-    return sorted(path for path in changed if not _exempt(path, exempt))
+    return changed
 
 
 def is_tracked(root: Path, path: str) -> bool:
@@ -243,8 +255,11 @@ def resolve_commit(root: Path, name: str) -> str | None:
 
 
 def changed_paths(root: Path, folder: str) -> list[str]:
-    """Paths under folder that are new, modified or deleted since the last commit."""
+    """Paths under folder that are new, modified or deleted since the last commit.
+
+    Renames are parsed as uncommitted_changes parses them (F16): both paths.
+    """
     output = run_git(
         root, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", folder
     )
-    return sorted({record[3:] for record in _split_z(output) if len(record) > 3})
+    return sorted(path for path in _porcelain_paths(output) if path)

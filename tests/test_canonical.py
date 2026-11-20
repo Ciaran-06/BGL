@@ -80,6 +80,30 @@ class TestRowHash:
             "aa58fba8483623bed37c1b02edfccbdd9a53123837c20bfa4cb4049993a2872e"
         )
 
+    def test_known_hash_with_decimals_as_text(self) -> None:
+        """The spec's canonical hash test: non-ASCII and decimals stored as text.
+
+        Expected bytes written out by hand (keys sorted, no spaces, UTF-8, the
+        decimals as their C19 strings). The hash was computed outside BGL with
+        printf '{"budget":20,"cost_bps":"5.0","dsr_threshold":"0.95",
+        "person":"Zo\\xc3\\xab"}' | sha256sum (one line, no newline).
+        """
+        row = {
+            "person": "Zoë",
+            "dsr_threshold": "0.95",
+            "cost_bps": "5.0",
+            "budget": 20,
+            "hash": "ignored",
+            "sig": "ignored",
+        }
+        assert canonical_bytes(row) == (
+            b'{"budget":20,"cost_bps":"5.0","dsr_threshold":"0.95",'
+            b'"person":"Zo\xc3\xab"}'
+        )
+        assert row_hash(row) == (
+            "36312b954e5a84517b5c70e0b6342cd653187c74b0f2f129bcd8db32f9ec424b"
+        )
+
     def test_empty_row(self) -> None:
         assert row_hash({}) == hashlib.sha256(b"{}").hexdigest()
 

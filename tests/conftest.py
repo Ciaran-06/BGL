@@ -213,6 +213,20 @@ class Project:
         return json.loads((self.root / path).read_text("utf-8"))
 
 
+def hard_kill(run: Run) -> str:
+    """Leave an open run as a hard kill would: open row, no close row, lock free."""
+    from bgl import audit
+
+    state = run._open_state
+    assert state is not None
+    audit.stop_watching()
+    if state.capture is not None:
+        state.capture.stop()
+    state.stack.close()
+    run._state = "closed"  # so leaving the with block writes nothing
+    return state.run_id
+
+
 @pytest.fixture
 def git_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep the developer's own git config (signing, hooks, user) out of tests."""

@@ -27,11 +27,29 @@ def test_authorized_key_matches_ssh_format() -> None:
     )
 
 
-def test_independent_verifier_accepts_it() -> None:
-    external = pytest.importorskip("sshsig")
-    armored = sshsig.sign(KEY, MESSAGE)
-    key = external.PublicKey.from_openssh_str(sshsig.authorized_key(PUBLIC))
-    assert external.verify(MESSAGE, armored, [key], namespace="file") == key
+# Made by OpenSSH 10.5p1, independently of BGL: KEY written as an OpenSSH
+# private key file, MESSAGE written to msg with no newline, then
+#   ssh-keygen -Y sign -f key -n file msg
+# Ed25519 signatures are deterministic, so BGL must produce the same bytes. The
+# reverse was also checked once by hand: ssh-keygen -Y verify -n file accepted
+# the signature sshsig.sign makes ("Good "file" signature").
+SSH_KEYGEN_SIGNATURE = (
+    "-----BEGIN SSH SIGNATURE-----\n"
+    "U1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgO2onvM62pC1io6jQKm8Nc2UyFX\n"
+    "cd4kOmOsBIoYtZ2ikAAAAEZmlsZQAAAAAAAAAGc2hhNTEyAAAAUwAAAAtzc2gtZWQyNTUx\n"
+    "OQAAAEDzUFMXHptNZ2fjBOLA90bZMBgza7QKGw3XhousXcfSS3ixTgbLc3k9PODT6rKfoz\n"
+    "8WQZSTZp1CjLU+IyIMNDUJ\n"
+    "-----END SSH SIGNATURE-----\n"
+)
+
+
+def test_matches_ssh_keygen() -> None:
+    assert sshsig.sign(KEY, MESSAGE) == SSH_KEYGEN_SIGNATURE
+
+
+def test_verifies_ssh_keygen_output() -> None:
+    assert sshsig.verify(PUBLIC, MESSAGE, SSH_KEYGEN_SIGNATURE)
+    assert not sshsig.verify(PUBLIC, MESSAGE + b"x", SSH_KEYGEN_SIGNATURE)
 
 
 @pytest.mark.parametrize(

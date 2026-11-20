@@ -8,12 +8,15 @@ OpenTimestamps calendars. What comes back is committed with the ledger:
 - <ledger>/proofs/<CODE>/<head>.ots: the OpenTimestamps proof.
 
 Witness status is worked out from these files and the logs, never written in a
-row. Network failures never stop a run: the head simply stays pending, and
-`bgl witness` retries it.
+row. The one exception (N10): a run's close file records the entry the R23 call
+returned for its open head, as `open_witness`, and the close row binds it
+through close_sha256. Network failures never stop a run: the head simply stays
+pending, and `bgl witness` retries it, though a retried open head never makes
+that run's open witnessed.
 """
 
-import contextlib
 import dataclasses
+import hashlib
 import json
 from collections.abc import Iterable, Mapping
 from pathlib import Path
@@ -30,6 +33,7 @@ from bgl.locks import ledger_lock
 from bgl.records import LedgerView
 from bgl.writers import Identity
 
+_ABANDONED: Final[str] = "abandoned"
 WITNESS_DIR: Final[str] = "witness"
 PROOFS_DIR: Final[str] = "proofs"
 
@@ -52,6 +56,44 @@ class SubmitResult:
     logged: list[str] = dataclasses.field(default_factory=list)
     stamped: list[str] = dataclasses.field(default_factory=list)
     problems: list[str] = dataclasses.field(default_factory=list)
+    # Each head logged by this call, mapped to the record Rekor returned for it.
+    records: dict[str, dict[str, Any]] = dataclasses.field(default_factory=dict)
+
+
+OPEN_WITNESS_FIELDS: Final[tuple[str, ...]] = (
+    "uuid",
+    "log_index",
+    "integrated_time",
+    "log_id",
+    "signed_entry_timestamp",
+)
+
+
+def open_witness(record: Mapping[str, Any]) -> dict[str, Any]:
+    """The close file's open_witness: the Rekor entry the R23 call returned.
+
+    [DECISION] N10 (spec text pending): UUID, log index, integrated time, log
+    ID and signed entry timestamp, taken from a record that check_record has
+    already accepted. Raises WitnessError if a field is missing or malformed.
+    """
+    try:
+        entry = record["entry"]
+        found = {
+            "uuid": record["uuid"],
+            "log_index": entry["logIndex"],
+            "integrated_time": entry["integratedTime"],
+            "log_id": entry["logID"],
+            "signed_entry_timestamp": entry["verification"]["signedEntryTimestamp"],
+        }
+    except (KeyError, TypeError):
+        raise WitnessError("the Rekor record lacks an open_witness field") from None
+    for name in ("uuid", "log_id", "signed_entry_timestamp"):
+        if not isinstance(found[name], str) or not found[name]:
+            raise WitnessError(f"the Rekor record's {name} is not text")
+    for name in ("log_index", "integrated_time"):
+        if type(found[name]) is not int:
+            raise WitnessError(f"the Rekor record's {name} is not a whole number")
+    return found
 
 
 def own_heads(root: Path, project: Project, writer: Writer) -> list[str]:
@@ -79,6 +121,7 @@ def submit_heads(
                 rekor.check_record(record, identity.writer.public_key)
                 _write(record_file, canonical_json(record) + b"\n")
                 result.logged.append(head)
+                result.records[head] = record
             except WitnessError as error:
                 result.problems.append(f"Rekor, head {head[:12]}: {error}")
         proof_file = proof_path(root, project, code, head)
@@ -96,24 +139,46 @@ def submit_heads(
 
 
 def submit_current_head(
-    root: Path, project: Project, identity: Identity
-) -> SubmitResult:
-    """R23: witness the writer's newest head.
+    root: Path, project: Project, identity: Identity, head: str | None = None
+) -> dict[str, Any] | None:
+    """R23: witness the writer's newest head, or the given head.
+
+    Returns the Rekor record this call obtained and checked for the head, or
+    None if Rekor was not reached, refused it, or witnessing is off (N10).
 
     [DECISION] After an append only the new head is submitted, so a backlog
     from an offline spell never delays a run's code. `bgl witness` submits
     the backlog.
+
+    [DECISION] N10 (spec text pending): a caller that knows the head it just
+    appended passes it. Another process of the same writer may have appended
+    since, and "the newest head" would then be that process's row. A head
+    that already had a record before this call gets None: only an entry
+    this call made is the R23 call's result.
     """
     if project.witness is None:
-        return SubmitResult()
-    heads = own_heads(root, project, identity.writer)
-    return submit_heads(root, project, identity, heads[-1:])
+        return None
+    if head is None:
+        heads = own_heads(root, project, identity.writer)
+        if not heads:
+            return None
+        head = heads[-1]
+    result = submit_heads(root, project, identity, [head])
+    return result.records.get(head)
 
 
-def after_append(root: Path, project: Project, identity: Identity) -> None:
-    """submit_current_head, never raising: witnessing must not stop a run."""
-    with contextlib.suppress(Exception):
-        submit_current_head(root, project, identity)
+def after_append(
+    root: Path, project: Project, identity: Identity, head: str | None = None
+) -> dict[str, Any] | None:
+    """submit_current_head, never raising Exception: witnessing must not stop a run.
+
+    Returns the record from the call, or None on any failure (N10). A
+    KeyboardInterrupt still propagates; the caller decides what it means.
+    """
+    try:
+        return submit_current_head(root, project, identity, head)
+    except Exception:
+        return None
 
 
 def submit_pending(root: Path, project: Project, identity: Identity) -> SubmitResult:
@@ -148,6 +213,8 @@ def upgrade_proofs(root: Path, project: Project) -> UpgradeResult:
                     path.read_bytes(), head, witness.ots_calendars
                 )
             except WitnessError:
+                # [DECISION] F21: a proof that cannot be upgraded now is left as
+                # it is and retried next time; verify reports unreadable ones.
                 continue
             if changed:
                 _write(path, data)
@@ -265,29 +332,126 @@ def chain_witness(root: Path, project: Project, view: LedgerView) -> list[ChainW
     return found
 
 
-def unwitnessed_opens(view: LedgerView, chains: Iterable[ChainWitness]) -> list[str]:
-    """Opens with no witnessed head between the open row and its close row.
+@dataclasses.dataclass(frozen=True)
+class OpenWitnessReport:
+    """Every open row's witness state as far as the files here show (N10, N60).
 
-    A head is witnessed when it has both a Rekor record and a stamp. Its
-    timing (whether Bitcoin confirmed it, and when) is judged by the gate.
+    witnessed rests on stored records only: not checked against the log
+    (N11). The gate asks the live log.
     """
-    witnessed = {chain.code: chain.logged & chain.stamped for chain in chains}
-    missing = []
+
+    witnessed: tuple[str, ...]
+    unwitnessed: tuple[str, ...]
+    pending: tuple[str, ...]  # in progress here, with no close row yet
+
+
+def _stored_open_witness(
+    root: Path, project: Project, code: str, head: str
+) -> dict[str, Any] | None:
+    """open_witness built from the stored record for head, or None."""
+    try:
+        record = json.loads(record_path(root, project, code, head).read_bytes())
+        return open_witness(record)
+    except (OSError, ValueError, WitnessError):
+        return None
+
+
+def _recorded_open_witness(
+    root: Path, project: Project, run_id: str, close: Mapping[str, Any]
+) -> object:
+    """The open_witness a normal close's close file holds, or None.
+
+    [DECISION] The close file is read only at the place BGL writes it, and only
+    if it still matches the close row's close_sha256, so an edited open_witness
+    never counts (N10).
+    """
+    expected = f"{project.runs_dir}/{run_id}.close.json"
+    if close["close_file"] != expected:
+        return None
+    try:
+        data = (root / expected).read_bytes()
+    except OSError:
+        return None
+    if hashlib.sha256(data).hexdigest() != close["close_sha256"]:
+        return None
+    try:
+        content = json.loads(data)
+    except ValueError:
+        return None
+    return content.get("open_witness") if isinstance(content, dict) else None
+
+
+def classify_opens(
+    root: Path,
+    project: Project,
+    view: LedgerView,
+    chains: Iterable[ChainWitness],
+    in_progress: Iterable[str] = (),
+) -> OpenWitnessReport:
+    """Sort every open row into witnessed, unwitnessed or pending.
+
+    Only the open head matters: the open row's own hash, which R23 submitted
+    before the run's code started (N10). An entry made later, by `bgl witness`
+    say, never makes a closed run's open witnessed.
+
+    - A run with a normal (not abandoned) close is witnessed when its close
+      file's open_witness is not null, equals the stored record for its open
+      head, and that head has a stamp.
+    - A run with no normal close (no close row, or only an abandoned one) is
+      pending while in progress here. Otherwise it is witnessed when a stored
+      record and a stamp exist for its open head (N60): it has no result or
+      series, so a late entry gains nothing.
+
+    [DECISION] F18 is met by construction: no window of heads after the open
+    is consulted, so no close row (in this or another chain) can extend it.
+    [DECISION] Both cases also need a stamp of the open head, as the spec's
+    witness definition does; whether Bitcoin confirmed it, and when, is the
+    gate's question. Checking the record against the live log is the gate's
+    too (N11).
+    """
+    usable = {chain.code: chain.logged & chain.stamped for chain in chains}
+    running = set(in_progress)
+    closes: dict[object, list[Mapping[str, Any]]] = {}
+    for row in view.rows:
+        if row["event"] == "close":
+            closes.setdefault(row["id"], []).append(row)
+    witnessed: list[str] = []
+    unwitnessed: list[str] = []
+    pending: list[str] = []
     for code, chain in view.report.chains.items():
-        rows = list(chain.rows)
-        closes = {
-            row["id"]: index
-            for index, row in enumerate(rows)
-            if row["event"] == "close"
-        }
-        for index, row in enumerate(rows):
+        for row in chain.rows:
             if row["event"] != "open":
                 continue
-            end = closes.get(row["id"], len(rows))
-            window = {rows[i]["hash"] for i in range(index, end)}
-            if not window & witnessed.get(code, set()):
-                missing.append(str(row["id"]))
-    return missing
+            run_id, head = str(row["id"]), row["hash"]
+            run_closes = closes.get(row["id"], [])
+            # [DECISION] N10, N60: a close is normal by its status, not by its
+            # close_file. Only an abandoned close may lack a close file (spec),
+            # so a normal close with none never earns N60's leniency: it has
+            # no open_witness and the open is unwitnessed. verify fails it too.
+            normal = [close for close in run_closes if close["status"] != _ABANDONED]
+            if not run_closes and run_id in running:
+                pending.append(run_id)
+                continue
+            ok = head in usable.get(code, set())
+            if ok and normal:
+                stored = _stored_open_witness(root, project, code, head)
+                ok = stored is not None and all(
+                    _recorded_open_witness(root, project, run_id, close) == stored
+                    for close in normal
+                )
+            (witnessed if ok else unwitnessed).append(run_id)
+    return OpenWitnessReport(tuple(witnessed), tuple(unwitnessed), tuple(pending))
+
+
+def unwitnessed_opens(
+    root: Path,
+    project: Project,
+    view: LedgerView,
+    chains: Iterable[ChainWitness],
+    in_progress: Iterable[str] = (),
+) -> list[str]:
+    """The run IDs classify_opens finds unwitnessed."""
+    return list(classify_opens(root, project, view, chains, in_progress).unwitnessed)
 
 
 # --- the gate's discard check (network) -------------------------------------

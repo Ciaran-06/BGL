@@ -3,8 +3,8 @@ from pathlib import Path
 import pytest
 from conftest import Project, run_git
 
-from bgl.cli import EXIT_FAILED, EXIT_OK, EXIT_USAGE, main
-from bgl.home import HOME_ENV
+from bgl.cli import COMMANDS, EXIT_FAILED, EXIT_OK, EXIT_USAGE, build_parser, main
+from bgl.home import HOME_ENV, create_machine_id
 
 
 def run_cli(monkeypatch: pytest.MonkeyPatch, cwd: Path, *argv: str) -> int:
@@ -71,6 +71,38 @@ def test_repair(
     assert run_cli(monkeypatch, project.root, "verify") == EXIT_OK
     assert run_cli(monkeypatch, project.root, "repair") == EXIT_FAILED
     assert "nothing to repair" in capsys.readouterr().err
+
+
+def test_repair_from_a_second_machine_is_refused(
+    project: Project,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """F1: the repair row would fail verify, so nothing changes."""
+    project.run()
+    chain = project.root / "bgl" / "ledger" / "CG1.jsonl"
+    chain.write_bytes(chain.read_bytes() + b'{"torn"')
+    before = chain.read_bytes()
+    (project.home / "machine_id").unlink()
+    create_machine_id(project.home)
+    assert run_cli(monkeypatch, project.root, "repair") == EXIT_FAILED
+    assert "machine_id differs" in capsys.readouterr().err
+    assert chain.read_bytes() == before
+
+
+def test_command_table() -> None:
+    """Each command is one entry; later build steps add theirs."""
+    assert [command.name for command in COMMANDS] == [
+        "init",
+        "join",
+        "status",
+        "verify",
+        "repair",
+        "witness",
+    ]
+    parser = build_parser()
+    args = parser.parse_args(["verify", "--contains", "a" * 64])
+    assert args.handler is COMMANDS[3].handler and args.contains == "a" * 64
 
 
 def test_status_shows_studies_and_chains(

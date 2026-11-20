@@ -29,3 +29,33 @@ jobs:
         run: uv run mypy src
       - name: Tests
         run: uv run pytest
+
+  dependency-audit:
+    # F13, N20: the locked dependencies, runtime and dev, checked for known
+    # vulnerabilities. uv.lock pins hashes, so pip-audit needs no resolver.
+    # The export keeps environment markers (numpy differs below and above
+    # Python 3.12; colorama is Windows only) and pip-audit skips lines whose
+    # marker does not match the Python running it, so one run sees only part
+    # of the lock. The matrix below runs it in every system and version CI
+    # tests, which together reach every marker the lock holds today.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.11", "3.14"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Export the locked dependencies
+        shell: bash
+        run: >
+          uv export --locked --all-groups --format requirements-txt
+          --no-emit-project -o "${{ runner.temp }}/requirements.txt"
+      - name: pip-audit
+        shell: bash
+        run: >
+          uvx --python ${{ matrix.python }} pip-audit==2.10.1 --strict
+          --disable-pip -r "${{ runner.temp }}/requirements.txt"

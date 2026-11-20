@@ -1,16 +1,21 @@
 """The run lifecycle: what an opened run writes, and how it closes."""
 
+import contextlib
 import hashlib
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
 import pytest
 from conftest import Project
 
-from bgl import RunError, RunInvalid, budget, verify_ledger
+from bgl import RunError, RunInvalid, budget, verify_ledger, witness
+from bgl import run as run_module
+from bgl.capture import OutputCapture
 from bgl.errors import LockTimeoutError
 from bgl.locks import file_lock
+from bgl.verify import verify_project
 
 SERIES = {
     "gross": {1: {"2020-01-02": 0.01}, 2: {"2020-01-02": 0.02}},
@@ -179,6 +184,18 @@ class TestManifestAndCloseFile:
         close = project.json(project.last()["close_file"])
         assert close["files_opened"] == ["docs/alpha.md"]
 
+    def test_sqlite_database_is_listed_as_opened(self, project: Project) -> None:
+        import sqlite3
+
+        with project.start() as run:
+            connection = sqlite3.connect(project.root / "data" / "prices.db")
+            connection.execute("create table t (x)")
+            connection.close()
+            sqlite3.connect(":memory:").close()
+            run.result("done")
+        close = project.json(project.last()["close_file"])
+        assert close["files_opened"] == ["data/prices.db"]
+
     def test_outputs_are_hashed_at_close(self, project: Project) -> None:
         with project.start() as run:
             out = project.root / "results" / "table.csv"
@@ -241,6 +258,180 @@ class TestStatus:
         with pytest.raises(RuntimeError), project.start():
             raise RuntimeError("boom")
         assert budget("alpha", root=project.root).used == 1
+
+
+class TestFailureAfterTheOpenRow:
+    """F3: anything that fails between the open row and the body closes the run."""
+
+    def fail_first_call(
+        self, monkeypatch: pytest.MonkeyPatch, target: Any, name: str, error: Any
+    ) -> list[int]:
+        calls: list[int] = []
+        real = getattr(target, name)
+
+        def patched(*args: Any, **kwargs: Any) -> Any:
+            calls.append(1)
+            if len(calls) == 1:
+                raise error
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(target, name, patched)
+        return calls
+
+    def check_one_close(self, project: Project, status: str) -> dict[str, Any]:
+        assert project.events() == ["lock", "open", "close"]
+        closed = project.last()
+        assert closed["status"] == status
+        assert closed["id"] == "AL-R001-CG1"
+        report = verify_project(project.root)
+        assert report.ok, report.failures
+        lock = project.root / ".bgl" / "locks" / "AL-R001-CG1.lock"
+        with file_lock(lock, timeout=0):
+            pass  # released
+        assert budget("alpha", root=project.root).used == 1
+        return closed
+
+    def test_ctrl_c_in_the_witness_call(
+        self, project: Project, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # after_append lets KeyboardInterrupt through: only Exception is caught.
+        self.fail_first_call(
+            monkeypatch, witness, "submit_current_head", KeyboardInterrupt()
+        )
+        with pytest.raises(KeyboardInterrupt), project.start():
+            pytest.fail("the body must not run")
+        self.check_one_close(project, "interrupted")
+
+    def test_ctrl_c_while_releasing_the_ledger_lock(
+        self, project: Project, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The open row is written; Ctrl+C lands as the ledger lock is let go."""
+        real = run_module.ledger_lock
+
+        @contextlib.contextmanager
+        def interrupted_on_release(root: Path) -> Iterator[None]:
+            with real(root):
+                yield
+            raise KeyboardInterrupt
+
+        monkeypatch.setattr(run_module, "ledger_lock", interrupted_on_release)
+        with pytest.raises(KeyboardInterrupt), project.start():
+            pytest.fail("the body must not run")
+        # Restore only this patch: undo() would also drop BGL_HOME and git_env.
+        monkeypatch.setattr(run_module, "ledger_lock", real)
+        self.check_one_close(project, "interrupted")
+
+    def test_ctrl_c_while_the_open_row_is_appended(
+        self, project: Project, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The row reached the file; Ctrl+C lands before the append returns."""
+        real = run_module.append_row_unlocked
+
+        def interrupted_after_write(*args: Any, **kwargs: Any) -> Any:
+            row = real(*args, **kwargs)
+            if row["event"] == "open":
+                raise KeyboardInterrupt
+            return row
+
+        monkeypatch.setattr(run_module, "append_row_unlocked", interrupted_after_write)
+        with pytest.raises(KeyboardInterrupt), project.start():
+            pytest.fail("the body must not run")
+        self.check_one_close(project, "interrupted")
+
+    def test_ctrl_c_before_the_open_row_writes_no_close(
+        self, project: Project, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        real = run_module.append_row_unlocked
+
+        def interrupted_before_write(*args: Any, **kwargs: Any) -> Any:
+            if args[-1]["event"] == "open":
+                raise KeyboardInterrupt
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(run_module, "append_row_unlocked", interrupted_before_write)
+        with pytest.raises(KeyboardInterrupt), project.start():
+            pytest.fail("the body must not run")
+        assert project.events() == ["lock"]  # no open row, so no close row
+        lock = project.root / ".bgl" / "locks" / "AL-R001-CG1.lock"
+        with file_lock(lock, timeout=0):
+            pass  # released
+
+    def test_the_close_head_is_witnessed(
+        self, project: Project, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """_abort submits the close row's head like any close (R23's sibling)."""
+        heads: list[object] = []
+        real = witness.after_append
+
+        def record(*args: Any) -> Any:
+            heads.append(args[3] if len(args) > 3 else "newest")
+            if len(heads) == 1:
+                raise RuntimeError("x")
+            return real(*args)
+
+        monkeypatch.setattr(witness, "after_append", record)
+        with pytest.raises(RuntimeError), project.start():
+            pytest.fail("the body must not run")
+        assert heads == [project.rows()[1]["hash"], "newest"]
+
+    def test_error_in_the_witness_call(
+        self, project: Project, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.fail_first_call(monkeypatch, witness, "after_append", RuntimeError("x"))
+        with pytest.raises(RuntimeError), project.start():
+            pytest.fail("the body must not run")
+        closed = self.check_one_close(project, "crashed")
+        assert closed["reason"] == "failed after the open row: RuntimeError: x"
+        error = project.json(closed["close_file"])["error"]
+        assert error["type"] == "RuntimeError"
+
+    def test_sys_exit_0_there_is_still_a_crash(
+        self, project: Project, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.fail_first_call(monkeypatch, witness, "after_append", SystemExit(0))
+        with pytest.raises(SystemExit), project.start():
+            pytest.fail("the body must not run")
+        self.check_one_close(project, "crashed")
+
+    def test_output_capture_failing_to_start(
+        self, project: Project, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.fail_first_call(monkeypatch, OutputCapture, "start", OSError("disk"))
+        before = sys.stdout
+        with pytest.raises(OSError, match="disk"), project.start():
+            pytest.fail("the body must not run")
+        assert sys.stdout is before
+        closed = self.check_one_close(project, "crashed")
+        output = project.json(closed["close_file"])["output"]
+        assert output["stdout"]["sha256"] is None
+        assert output["stdout"]["bytes"] is None
+
+    def test_the_failed_run_is_never_closed_twice(
+        self, project: Project, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.fail_first_call(monkeypatch, witness, "after_append", RuntimeError("x"))
+        run = project.start()
+        with pytest.raises(RuntimeError):
+            run.__enter__()
+        run.__exit__(None, None, None)  # a caller that exits anyway
+        with pytest.raises(RunError, match="not open"):
+            run.result("done")
+        assert project.events().count("close") == 1
+
+    def test_dry_run_writes_only_its_dry_row(
+        self, project: Project, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fixture = project.write("scratch/fixture.csv", "a,b\n0,0\n")
+        self.fail_first_call(
+            monkeypatch, witness, "submit_current_head", KeyboardInterrupt()
+        )
+        with (
+            pytest.raises(KeyboardInterrupt),
+            project.start(dry=True, dry_inputs={"data/design.csv": fixture}),
+        ):
+            pytest.fail("the body must not run")
+        assert project.events() == ["dry"]
+        (project.root / "data" / "design.csv").read_text()  # not watching
 
 
 class TestReturns:
@@ -326,8 +517,10 @@ class TestOutputCapture:
         assert close["output"]["stdout"] == {
             "file": "bgl/runs/output/AL-R001-CG1.stdout",
             "sha256": sha(out),
+            "bytes": len(b"to stdout\n"),  # F9
             "holdout_load": None,
         }
+        assert close["output"]["stderr"]["bytes"] == len(b"to stderr\n")
 
     def test_uncounted_run_is_not_captured(self, project: Project) -> None:
         with project.start(run_type="exploratory") as run:
@@ -521,6 +714,18 @@ class TestInvalid:
             run.result("split done")
         assert project.last()["status"] == "ok"
 
+    def test_sqlite_open_of_a_holdout_file_is_invalid(self, project: Project) -> None:
+        """F8: sqlite opens files in C; its audit event is treated as an open."""
+        import sqlite3
+
+        with (
+            pytest.raises(RunInvalid, match="R20: the run opened the holdout file"),
+            project.start(study="beta") as run,
+        ):
+            sqlite3.connect(project.root / "data" / "holdout.csv").close()
+            run.result("done")
+        assert project.last()["status"] == "invalid"
+
     def test_other_studies_holdout_is_not_this_studys_business(
         self, project: Project
     ) -> None:
@@ -632,6 +837,15 @@ class TestDryRun:
             with project.start(dry=True, dry_inputs={"data/design.csv": fixture}):
                 (project.root / "data" / "design.csv").read_text()
         assert project.events() == ["dry"]
+
+    def test_sqlite_open_is_blocked(self, project: Project) -> None:
+        import sqlite3
+
+        fixture = self.fixture_file(project)
+        with pytest.raises(PermissionError, match="R25"):
+            with project.start(dry=True, dry_inputs={"data/design.csv": fixture}):
+                sqlite3.connect(project.root / "data" / "prices.db")
+        assert not (project.root / "data" / "prices.db").exists()
 
     def test_block_ends_with_the_run(self, project: Project) -> None:
         fixture = self.fixture_file(project)

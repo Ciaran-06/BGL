@@ -262,6 +262,39 @@ class TestC2Paths:
         bad = replace(MINIMAL_VALID, 'ledger = "bgl/ledger"', f"ledger = {ledger}")
         assert_has_error(load_error(tmp_path, bad), "C2", "project.ledger")
 
+    @pytest.mark.parametrize(
+        ("ledger", "runs_dir"),
+        [
+            pytest.param("bgl/ledger", "bgl/ledger", id="equal"),
+            pytest.param("bgl/ledger", "bgl/./ledger/", id="equal_after_tidying"),
+            pytest.param("bgl/ledger", "bgl/ledger/runs", id="runs_inside_ledger"),
+            pytest.param("bgl/runs/ledger", "bgl/runs", id="ledger_inside_runs"),
+            pytest.param("bgl", "bgl/runs", id="runs_deep_inside"),
+            pytest.param("bgl/Ledger", "bgl/ledger/runs", id="case_differs"),
+        ],
+    )
+    def test_ledger_and_runs_dir_overlap(
+        self, tmp_path: Path, ledger: str, runs_dir: str
+    ) -> None:
+        """F15: the two BGL folders may not be equal or nested."""
+        bad = replace(MINIMAL_VALID, 'ledger = "bgl/ledger"', f'ledger = "{ledger}"')
+        bad = replace(bad, 'runs_dir = "bgl/runs"', f'runs_dir = "{runs_dir}"')
+        assert_has_error(load_error(tmp_path, bad), "C2", "project.runs_dir")
+
+    @pytest.mark.parametrize(
+        ("ledger", "runs_dir"),
+        [
+            pytest.param("bgl/ledger", "bgl/ledger2", id="shared_prefix"),
+            pytest.param("ledger", "runs", id="siblings_at_root"),
+        ],
+    )
+    def test_ledger_and_runs_dir_apart(
+        self, tmp_path: Path, ledger: str, runs_dir: str
+    ) -> None:
+        good = replace(MINIMAL_VALID, 'ledger = "bgl/ledger"', f'ledger = "{ledger}"')
+        good = replace(good, 'runs_dir = "bgl/runs"', f'runs_dir = "{runs_dir}"')
+        load_config(write(tmp_path, good))
+
 
 class TestC3Budget:
     @pytest.mark.parametrize(

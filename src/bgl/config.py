@@ -575,6 +575,8 @@ def check_project(collector: ErrorCollector, data: Mapping[str, Any]) -> Project
     mode = check_mode(collector, project)
     ledger = _check_bgl_folder(collector, project, "ledger")
     runs_dir = _check_bgl_folder(collector, project, "runs_dir")
+    if ledger is not None and runs_dir is not None:
+        _check_folders_apart(collector, project, ledger, runs_dir)
     writers = check_registry(collector, project)
     witness_valid, witness = check_witness(collector, project, mode)
     return ProjectParts(
@@ -606,6 +608,29 @@ def _check_bgl_folder(
         )
         return None
     return path
+
+
+def _check_folders_apart(
+    collector: ErrorCollector, project: Mapping[str, Any], ledger: str, runs_dir: str
+) -> None:
+    """C2 (F15): ledger and runs_dir may not be equal, and neither inside the other.
+
+    [DECISION] F15 (spec text pending). The two hold different things under
+    different rules: chain files and witness folders in one, manifests,
+    close files and git-ignored series in the other. Overlap would let a run
+    file be read as a chain file (or the reverse) and mix committed with
+    ignored files. Compared case-insensitively, because on Windows and macOS
+    "bgl/Ledger" and "bgl/ledger" are one folder. Reported at runs_dir.
+    """
+    a, b = ledger.casefold(), runs_dir.casefold()
+    if a == b or a.startswith(b + "/") or b.startswith(a + "/"):
+        collector.add(
+            "C2",
+            "a folder apart from ledger: not the same folder, and neither inside "
+            f"the other (ledger is {ledger!r})",
+            key=key_path("project", "runs_dir"),
+            found=project.get("runs_dir"),
+        )
 
 
 def check_mode(collector: ErrorCollector, project: Mapping[str, Any]) -> Mode | None:

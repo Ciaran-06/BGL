@@ -15,7 +15,7 @@ A deployment gate then corrects the reported result for the number of variants t
 
 ```bash
 pip install bgl          # or: uv add bgl
-bgl init                 # writes bgl.toml, your writer key, an empty chain and .gitignore entries
+bgl init CODE PERSON     # writes bgl.toml, your writer key, an empty chain and .gitignore entries
 bgl join CODE PERSON     # sets up each further person or machine
 ```
 
@@ -86,6 +86,8 @@ uv run ruff check --fix .      # lint
 uv run mypy src                # type check (strict)
 uv run pytest                  # tests
 ```
+
+CI also audits the locked dependencies with `pip-audit` on the output of `uv export`, on every system and Python version it tests, so platform- and version-specific pins are covered.
 
 Optional Allure report: `uv run python scripts/dev_tests.py`. It needs the separate `allure` command-line tool, which runs on Java.
 

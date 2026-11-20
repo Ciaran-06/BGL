@@ -31,11 +31,13 @@ def refused(project: Project, rule: str, **overrides: Any) -> RunRefused:
     return info.value
 
 
-def refused_row(project: Project, rule: str, **overrides: Any) -> dict[str, Any]:
+def refused_row(
+    project: Project, rule: str, *, chain: str = "CG1", **overrides: Any
+) -> dict[str, Any]:
     """Like refused, and check the refusal was recorded as the chain's last row."""
-    before = len(project.rows())
+    before = len(project.rows(chain))
     error = refused(project, rule, **overrides)
-    rows = project.rows()
+    rows = project.rows(chain)
     assert len(rows) == before + 1, "a refusal writes exactly one row"
     row = rows[-1]
     assert (row["event"], row["status"]) == ("refused", "refused")
@@ -321,6 +323,31 @@ class TestR3CleanCode:
     def test_no_git_user(self, project: Project) -> None:
         run_git(project.root, "config", "--unset", "user.email")
         assert "git config" in refused_row(project, "R3")["reason"]
+
+    @pytest.mark.parametrize("run_type", ["diagnostic", "exploratory"])
+    def test_config_file_must_be_tracked(self, project: Project, run_type: str) -> None:
+        """N18: bgl.toml itself must be tracked."""
+        run_git(project.root, "rm", "-q", "--cached", "bgl.toml")
+        project.write(".gitignore", ".bgl/\nscratch/\nbgl.toml\n")
+        project.commit("stop tracking bgl.toml")
+        row = refused_row(project, "R3", run_type=run_type)
+        assert "bgl.toml is not tracked" in row["reason"]
+
+
+class TestR22WithoutACommit:
+    def test_lock_content_problem_is_a_refusal_not_an_assert(
+        self, project: Project
+    ) -> None:
+        """F17: with a lock and no commit to compare, R22 names the git problem."""
+        project.run()
+        run_git(project.root, "checkout", "-q", "--orphan", "fresh")
+        row = refused_row(project, "R22")
+        assert "no commits" in row["reason"]
+
+    def test_first_counted_open_without_a_commit(self, project: Project) -> None:
+        run_git(project.root, "checkout", "-q", "--orphan", "fresh")
+        assert "no commits" in refused_row(project, "R22")["reason"]
+        assert "lock" not in project.events()
 
 
 class TestR3bUntrackedPython:
@@ -727,6 +754,96 @@ class TestR2Budget:
         project.commit("no budget")
         refused_row(project, "R2")
         project.run(run_type="exploratory")
+
+
+def second_writer(project: Project, *, custodian: bool = False) -> None:
+    """Register HC1 (custodian_a) on this machine; CG1 stays the writer."""
+    project.add_writer("HC1", "custodian_a")
+    if custodian:
+        project.custodian = "custodian_a"
+    project.write_toml()
+    project.commit("add HC1")
+
+
+class TestAcrossChains:
+    """Rules that count every chain on this machine, not only the writer's."""
+
+    def test_r4_duplicate_in_another_chain(self, project: Project) -> None:
+        second_writer(project)
+        first = project.run(config={"a": 1})
+        project.use_writer("HC1")
+        row = refused_row(project, "R4", chain="HC1", config={"a": 1})
+        assert first in row["reason"]
+        assert project.last("HC1")["chain"] == "HC1"
+
+    def test_r6_claim_decided_in_another_chain(self, project: Project) -> None:
+        second_writer(project)
+        first = project.run(**CONFIRM)
+        project.use_writer("HC1")
+        row = refused_row(project, "R6", chain="HC1", **CONFIRM, config={"again": 1})
+        assert first in row["reason"]
+
+    def test_r20_holdout_opened_once_across_chains(self, project: Project) -> None:
+        second_writer(project)  # rewrites bgl.toml, so edit it afterwards
+        project.edit_toml(
+            'claims = ["effect_exists"]\nprior_trials = 0\nholdout_start',
+            'claims = ["effect_exists", "effect_lasts"]\nprior_trials = 0\n'
+            "holdout_start",
+        )
+        project.commit("two claims in beta")
+        design = project.run(study="beta")
+        first = project.run(**project.holdout_arguments(design))
+        project.use_writer("HC1")
+        row = refused_row(
+            project,
+            "R20",
+            chain="HC1",
+            **project.holdout_arguments(design, claims=["effect_lasts"]),
+        )
+        assert first in row["reason"] and "once" in row["reason"]
+
+
+class TestReplayRuns:
+    REPLAY: dict[str, Any] = {
+        "study": "beta",
+        "run_type": "replay",
+        "sample": "live",
+        "variants": 1,
+        "prediction": None,
+        "sample_start": None,
+        "sample_end": None,
+    }
+
+    def test_only_the_custodian_opens_replay_runs(self, project: Project) -> None:
+        second_writer(project, custodian=True)
+        row = refused_row(project, "R20", **self.REPLAY)
+        assert "only the custodian (custodian_a) may open replay runs" in row["reason"]
+        project.use_writer("HC1")
+        project.run(**self.REPLAY)
+        assert project.last("HC1")["status"] == "ok"
+        assert project.last("HC1")["id"] == "BE-P001-HC1"
+
+    def test_without_a_custodian_anyone_may(self, project: Project) -> None:
+        project.run(**self.REPLAY)
+        assert project.last()["status"] == "ok"
+
+
+class TestSecondMachine:
+    """F1: BGL never writes a row verify would reject."""
+
+    def test_amend_from_a_second_machine_is_refused(self, project: Project) -> None:
+        from bgl.errors import RowRefusedError
+
+        project.run()
+        project.edit_toml("budget = 3", "budget = 9")
+        project.commit("more budget")
+        chain = project.root / "bgl" / "ledger" / "CG1.jsonl"
+        before = chain.read_bytes()
+        (project.home / "machine_id").unlink()
+        create_machine_id(project.home)
+        with pytest.raises(RowRefusedError, match="machine_id differs"):
+            amend_study(project.root, "alpha", "budget", "more variants")
+        assert chain.read_bytes() == before
 
 
 class TestDryRunRefusal:
