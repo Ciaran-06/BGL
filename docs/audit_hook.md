@@ -83,6 +83,13 @@ Python 3.13.18 on linux
    `forkserver` (the defaults on Windows, macOS and, from Python 3.14, Linux)
    the parent sees nothing and blocks nothing. With `fork` the copied hook
    still blocks in the child, but the parent never hears about the read.
+6. **sqlite is seen at connect, not at ATTACH (build step 8a, F8).** sqlite
+   opens files in C, but `sqlite3.connect` raises a `sqlite3.connect` audit
+   event naming the database, which the hook treats as an open: recorded,
+   blocked in a dry run, and `invalid` on a guarded file. A URI that names a
+   path is reported whatever its `mode=`. `ATTACH DATABASE 'file.db'` on an
+   open connection (an in-memory one included) raises no event naming the
+   file, so that read is invisible, like a native reader.
 
 ## Still to confirm
 

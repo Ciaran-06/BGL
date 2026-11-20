@@ -1,15 +1,16 @@
 """The bgl command line. It never creates a run: runs come only from start_run.
 
-Commands so far: init, join, status, verify, repair. The rest arrive in build
-step 10.
+Commands so far: init, join, status, verify, repair, witness. Each is one entry
+in COMMANDS; the rest arrive in build step 10, one entry each.
 """
 
 import argparse
+import dataclasses
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import Final
+from typing import Any, Final
 
 from bgl import __version__, git, witness
 from bgl.config import ConfigError, ConfigErrorGroup, load_config
@@ -94,7 +95,14 @@ def _print_status(status: ProjectStatus) -> None:
         if study.unwitnessed:
             print(
                 f"  Unwitnessed opens: {', '.join(study.unwitnessed)} "
-                "(bgl witness retries pending heads)"
+                "(not witnessed when opened; a later submission cannot change "
+                "that for a run with a close file)"
+            )
+        if study.witnessed_offline:
+            # N11: stored records are an offline convenience.
+            print(
+                f"  Witnessed opens: {len(study.witnessed_offline)}, from stored "
+                "records, not checked against the log"
             )
     print()
     for chain in status.chains:
@@ -191,7 +199,72 @@ def _cmd_witness(args: argparse.Namespace) -> int:
             "Run bgl witness again later to retry. Commit the ledger folder to "
             "keep the records."
         )
+    # [DECISION] F21: any submission that failed exits 1, so a script or CI
+    # job notices; stamps still waiting for Bitcoin are not a failure.
     return EXIT_FAILED if problems else EXIT_OK
+
+
+@dataclasses.dataclass(frozen=True)
+class Argument:
+    """One argparse argument: its names or flags, and add_argument's options."""
+
+    flags: tuple[str, ...]
+    options: Mapping[str, Any] = dataclasses.field(default_factory=dict)
+
+
+def _arg(*flags: str, **options: Any) -> Argument:
+    return Argument(flags, options)
+
+
+@dataclasses.dataclass(frozen=True)
+class Command:
+    """One row of the command table. Each later build step adds one entry."""
+
+    name: str
+    help: str
+    handler: Callable[[argparse.Namespace], int]
+    arguments: tuple[Argument, ...] = ()
+
+
+COMMANDS: Final[tuple[Command, ...]] = (
+    Command(
+        "init",
+        "set up BGL in this git repository",
+        _cmd_init,
+        (
+            _arg("code", help="your chain code, for example CG1"),
+            _arg("person", help="your name as it appears in the registry"),
+        ),
+    ),
+    Command(
+        "join",
+        "set up a new writer on this machine",
+        _cmd_join,
+        (
+            _arg("code", help="a new chain code, for example CG2"),
+            _arg("person", help="your name as it appears in the registry"),
+        ),
+    ),
+    Command("status", "budgets, N, claims and chains", _cmd_status),
+    Command(
+        "verify",
+        "check every chain and run file",
+        _cmd_verify,
+        (
+            _arg(
+                "--contains",
+                metavar="HASH",
+                help="also check that this row hash is in a chain here",
+            ),
+        ),
+    ),
+    Command("repair", "remove a torn tail from your chain", _cmd_repair),
+    Command(
+        "witness",
+        "retry pending witness submissions and upgrade stamps",
+        _cmd_witness,
+    ),
+)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -200,34 +273,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--version", action="version", version=f"bgl {__version__}")
     commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
-
-    init = commands.add_parser("init", help="set up BGL in this git repository")
-    init.add_argument("code", help="your chain code, for example CG1")
-    init.add_argument("person", help="your name as it appears in the registry")
-    init.set_defaults(handler=_cmd_init)
-
-    join = commands.add_parser("join", help="set up a new writer on this machine")
-    join.add_argument("code", help="a new chain code, for example CG2")
-    join.add_argument("person", help="your name as it appears in the registry")
-    join.set_defaults(handler=_cmd_join)
-
-    status = commands.add_parser("status", help="budgets, N, claims and chains")
-    status.set_defaults(handler=_cmd_status)
-
-    verify = commands.add_parser("verify", help="check every chain and run file")
-    verify.add_argument(
-        "--contains",
-        metavar="HASH",
-        help="also check that this row hash is in a chain here",
-    )
-    verify.set_defaults(handler=_cmd_verify)
-
-    repair = commands.add_parser("repair", help="remove a torn tail from your chain")
-    repair.set_defaults(handler=_cmd_repair)
-    witness_cmd = commands.add_parser(
-        "witness", help="retry pending witness submissions and upgrade stamps"
-    )
-    witness_cmd.set_defaults(handler=_cmd_witness)
+    for command in COMMANDS:
+        sub = commands.add_parser(command.name, help=command.help)
+        for argument in command.arguments:
+            sub.add_argument(*argument.flags, **argument.options)
+        sub.set_defaults(handler=command.handler)
     return parser
 
 

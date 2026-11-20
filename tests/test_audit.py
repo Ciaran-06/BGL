@@ -1,6 +1,7 @@
 import importlib.util
 import os
 import runpy
+import sqlite3
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -212,6 +213,91 @@ class TestDryRun:
         with pytest.raises(PermissionError):
             open(repo / "out.csv", "w")  # noqa: SIM115
         assert not (repo / "out.csv").exists()
+
+
+class TestSqlite:
+    """F8: sqlite3.connect opens its file in C; the hook treats it like open."""
+
+    def test_connect_is_recorded(self, repo: Path, watching: Watch) -> None:
+        sqlite3.connect(repo / "data" / "prices.db").close()
+        assert list(watching.files_opened) == ["data/prices.db"]
+
+    def test_declared_database_is_not_recorded(self, repo: Path) -> None:
+        watch = Watch(repo, declared=[repo / "data" / "prices.db"])
+        audit.start_watching(watch)
+        try:
+            sqlite3.connect(str(repo / "data" / "prices.db")).close()
+        finally:
+            audit.stop_watching()
+        assert list(watch.files_opened) == []
+
+    def test_guarded_file_is_a_violation(self, repo: Path, watching: Watch) -> None:
+        sqlite3.connect(repo / "data" / "holdout.csv").close()
+        assert watching.violations == [
+            "R20: the run opened the holdout file data/holdout.csv"
+        ]
+
+    def test_uri_form_is_seen(self, repo: Path, watching: Watch) -> None:
+        uri = (repo / "data" / "holdout.csv").as_uri() + "?mode=ro"
+        sqlite3.connect(uri, uri=True).close()
+        assert watching.violations == [
+            "R20: the run opened the holdout file data/holdout.csv"
+        ]
+
+    def test_repeated_mode_still_reads_the_file(
+        self, repo: Path, watching: Watch
+    ) -> None:
+        """sqlite uses the last mode=, so mode=memory then mode=ro opens the file."""
+        uri = (repo / "data" / "holdout.csv").as_uri() + "?mode=memory&mode=ro"
+        sqlite3.connect(uri, uri=True).close()
+        assert watching.violations == [
+            "R20: the run opened the holdout file data/holdout.csv"
+        ]
+
+    def test_in_memory_is_not_a_file(self, watching: Watch) -> None:
+        sqlite3.connect(":memory:").close()
+        sqlite3.connect("file::memory:?cache=shared", uri=True).close()
+        sqlite3.connect("").close()
+        assert list(watching.files_opened) == []
+        assert watching.hook_errors == 0
+
+    def test_blocked_in_a_dry_run(self, repo: Path, tmp_path: Path) -> None:
+        watch = Watch(repo, dry_allowed=[tmp_path / "fixture.db"])
+        audit.start_watching(watch)
+        try:
+            with pytest.raises(PermissionError, match="R25"):
+                sqlite3.connect(repo / "data" / "prices.db")
+        finally:
+            audit.stop_watching()
+        assert not (repo / "data" / "prices.db").exists()
+
+    @pytest.mark.parametrize(
+        ("database", "expected"),
+        [
+            (":memory:", None),
+            ("", None),
+            (b":memory:", None),
+            ("file::memory:", None),
+            # A named path is reported whatever mode= says: sqlite lets the
+            # last mode win, so mode=memory can be overridden.
+            ("file:x.db?mode=memory&cache=shared", "x.db"),
+            ("file:holdout.db?mode=memory&mode=ro", "holdout.db"),
+            ("file:x.db?cache=shared&mode=memory&mode=rw", "x.db"),
+            ("data/x.db", "data/x.db"),
+            (b"data/x.db", "data/x.db"),
+            (Path("data/x.db"), str(Path("data/x.db"))),
+            ("file:data/x.db?mode=ro", "data/x.db"),
+            ("file:data/my%20x.db", "data/my x.db"),
+            (5, None),
+        ],
+    )
+    def test_database_path(self, database: object, expected: str | None) -> None:
+        assert audit.sqlite_database_path(database) == expected
+
+    def test_absolute_uri(self, tmp_path: Path) -> None:
+        target = tmp_path / "x y.db"
+        found = audit.sqlite_database_path(target.as_uri())
+        assert found is not None and Path(found) == target
 
 
 class TestProcesses:

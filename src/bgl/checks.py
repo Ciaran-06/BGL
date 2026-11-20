@@ -17,7 +17,12 @@ from typing import Any, Final
 
 from bgl.config import Study
 from bgl.records import COUNTED_TYPES, LedgerView
-from bgl.studylock import LockContent, effective_lock, lock_differences
+from bgl.studylock import (
+    LockContent,
+    effective_lock,
+    lock_differences,
+    valid_lock_content,
+)
 from bgl.writers import Identity
 
 RUN_TYPES: Final[tuple[str, ...]] = (
@@ -75,6 +80,7 @@ class Facts:
     git_problem: str | None
     commit_signature: str | None
     changes: tuple[str, ...]
+    config_tracked: bool
     script_tracked: bool
     untracked_python: tuple[str, ...]
     untracked_modules: tuple[str, ...]
@@ -112,18 +118,34 @@ def check_r22(ctx: Context) -> str | None:
     """Study lock: bgl.toml must equal the locked values plus amendments."""
     request, facts, name = ctx.request, ctx.facts, ctx.study.name
     locks = ctx.view.events("lock", name)
-    if not locks:
-        # This run writes the lock if it is counted, so the content must exist.
-        return facts.lock_problem if request.counted else None
+    if not locks and not request.counted:
+        return None
+    # A counted run with no lock yet writes the lock, so the content must exist;
+    # with a lock, the content is what bgl.toml is compared against.
     if facts.lock_problem is not None:
         return facts.lock_problem
-    assert facts.lock_content is not None
+    if facts.lock_content is None:
+        # F17: no commit to build the content from. Say why, never assert.
+        # [DECISION] F17: this includes a counted first open with no commit,
+        # which used to pass R22 and be refused by R3 with the same git
+        # problem. R22 comes first in the rule index and cannot build the lock
+        # it must write, so it refuses; the run is refused either way.
+        return facts.git_problem or "the study lock's content could not be built"
+    if not locks:
+        return None
     amends = ctx.view.events("amend", name)
     hard: dict[str, None] = {}
     spec_changed = False
     # [DECISION] If chains on this machine hold more than one lock row for the
     # study (two writers each opened first), bgl.toml must match every one.
     for lock in locks:
+        if not valid_lock_content(lock["lock"]):
+            # [DECISION] A lock row whose content is malformed cannot be
+            # compared, so nothing can be shown to match it: refuse.
+            return (
+                f"the lock row of study {name} in chain {lock['chain']} is "
+                "malformed. Run bgl verify"
+            )
         state = effective_lock(lock["lock"], amends)
         for difference in lock_differences(state, facts.lock_content):
             if difference.spec_only:
@@ -153,6 +175,10 @@ def check_r3(ctx: Context) -> str | None:
             f"uncommitted changes to tracked files: {_list(facts.changes)}. "
             "Commit them first"
         )
+    if not facts.config_tracked:
+        # [DECISION] N18 (spec text pending): bgl.toml must be tracked, or the
+        # rules a run was checked under would leave no trace in git.
+        return "bgl.toml is not tracked by git. Commit it"
     if not facts.script_tracked:
         return f"the script {ctx.request.script} is not tracked by git. Commit it"
     return None
@@ -182,6 +208,8 @@ def check_r17(ctx: Context) -> str | None:
 def check_r8(ctx: Context) -> str | None:
     """Every declared input exists and is a file."""
     paths = ctx.request.inputs
+    # [DECISION] F21: an input listed twice (after tidying) is refused under R8,
+    # so the manifest and inputs_sha256 list each file once.
     repeated = sorted({path for path in paths if paths.count(path) > 1})
     if repeated:
         return f"inputs listed twice: {_list(repeated)}"

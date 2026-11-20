@@ -12,6 +12,7 @@ import pytest
 from bgl.canonical import canonical_json
 from bgl.errors import GitError, GitMissingError
 from bgl.git import (
+    changed_paths,
     code_fingerprint,
     commit_exists,
     commit_signature,
@@ -167,6 +168,28 @@ class TestUncommittedChanges:
     def test_repository_root_cannot_be_exempt(self, repo: Path, bad: str) -> None:
         with pytest.raises(ValueError):
             uncommitted_changes(repo, (bad,))
+
+
+class TestChangedPaths:
+    def test_new_and_modified(self, repo: Path) -> None:
+        write(repo, "bgl/ledger/CG1.jsonl", "{}\n{}\n")
+        write(repo, "bgl/ledger/witness/CG1/a.json")
+        write(repo, "src/model.py", "a = 3\n")  # outside the folder
+        assert changed_paths(repo, "bgl/ledger") == [
+            "bgl/ledger/CG1.jsonl",
+            "bgl/ledger/witness/CG1/a.json",
+        ]
+
+    def test_rename_lists_both_paths_whole(self, repo: Path) -> None:
+        """F16: the rename's second path is read as a path, not a record."""
+        git(repo, "mv", "bgl/ledger/CG1.jsonl", "bgl/ledger/CG2.jsonl")
+        assert changed_paths(repo, "bgl/ledger") == [
+            "bgl/ledger/CG1.jsonl",
+            "bgl/ledger/CG2.jsonl",
+        ]
+
+    def test_clean(self, repo: Path) -> None:
+        assert changed_paths(repo, "bgl/ledger") == []
 
 
 class TestIsTracked:

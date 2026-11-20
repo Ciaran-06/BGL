@@ -135,7 +135,8 @@ class TestCheckSeries:
         )
 
     def test_pandas_frame_and_series(self) -> None:
-        pd = pytest.importorskip("pandas")
+        import pandas as pd  # dev group (N20): this test must run, never skip
+
         index = pd.date_range("2020-01-02", periods=3, freq="D")
         gross = pd.DataFrame({1: [0.1, 0.2, 0.3], 2: [0.0, 0.1, 0.2]}, index=index)
         turnover = pd.DataFrame({1: [0, 0, 0], 2: [1, 1, 1]}, index=index)

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Final
 
 from bgl import git, witness
+from bgl.canonical import canonical_json
 from bgl.config import (
     Project,
     Study,
@@ -80,30 +81,138 @@ def lock_content(
     }
 
 
+def valid_lock_content(content: object) -> bool:
+    """True if a lock row's content has the shape lock_content builds.
+
+    verify reports a malformed lock as a finding (F12), and the run checks
+    refuse to compare against one, rather than fail with a traceback.
+    """
+    if not isinstance(content, Mapping):
+        return False
+    study, project = content.get("study"), content.get("project")
+    return (
+        set(content) == {"study", "registry", "spec_files", "project"}
+        and isinstance(study, Mapping)
+        and isinstance(study.get("spec_files"), list)
+        and isinstance(content["registry"], Mapping)
+        and isinstance(content["spec_files"], Mapping)
+        and isinstance(project, Mapping)
+        and set(project) == {"mode", "witness"}
+    )
+
+
+def _is_count(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
+def valid_amend(amend: object) -> bool:
+    """True if an amend row's content is {key, old, new} for an amendable key.
+
+    Only the shape is checked here; whether the change itself was allowed is
+    check_amendment's question, asked when the row is written.
+    """
+    if not isinstance(amend, Mapping) or set(amend) != {"key", "old", "new"}:
+        return False
+    key, new = amend["key"], amend["new"]
+    if key in _INCREASE_ONLY:
+        return _is_count(new)
+    if key == "claims":
+        return isinstance(new, list) and all(isinstance(c, str) for c in new)
+    if key == "gate":
+        return isinstance(new, Mapping)
+    if key == "spec_files":
+        return (
+            isinstance(new, Mapping)
+            and set(new) == {"paths", "hashes"}
+            and isinstance(new["paths"], list)
+            and isinstance(new["hashes"], Mapping)
+        )
+    return False
+
+
+def _same(left: object, right: object) -> bool:
+    """Equal as JSON, so true never equals 1 and 1 never equals "1"."""
+    try:
+        return canonical_json(left) == canonical_json(right)
+    except ValueError:
+        return False
+
+
+def _apply(state: LockContent, amend: Mapping[str, Any]) -> None:
+    key, new = amend["key"], copy.deepcopy(amend["new"])
+    if key == "spec_files":
+        state["study"]["spec_files"] = list(new["paths"])
+        state["spec_files"] = dict(new["hashes"])
+    else:
+        state["study"][key] = new
+
+
+def allowed_change(row: Mapping[str, Any]) -> bool:
+    """True if an amend row is well formed and its old -> new is an allowed change.
+
+    [DECISION] N13, N44 (spec text pending): the typed rules are checked again
+    whenever amendments are applied, not only when the row is written, so a
+    hand-made row that strengthens the evidence (a budget cut, a removed
+    claim) never applies and verify fails it until acknowledged. The gate
+    lists such rows too (N44).
+    """
+    amend = row["amend"]
+    if not valid_amend(amend):
+        return False
+    try:
+        check_amendment(amend["key"], amend["old"], amend["new"], row.get("fix_commit"))
+    except AmendError:
+        return False
+    return True
+
+
+def apply_amendments(
+    locked: Mapping[str, Any], amend_rows: Sequence[Mapping[str, Any]]
+) -> tuple[LockContent, list[Mapping[str, Any]]]:
+    """The lock with every fitting amendment applied, and the ones that never fit.
+
+    amend_rows must hold each chain's rows in chain order (as LedgerView does).
+
+    [DECISION] N13 (spec text pending): an amendment applies where its recorded
+    old equals the value then in force. Application repeats until no
+    remaining amendment fits, so an amendment written on top of another
+    applies after it whatever the registry order of their chains. Of the
+    fitting amendments in one chain, the earliest in that chain applies
+    first, because one writer's rows are in the order they were written (so
+    S0->S1, S1->S0, S0->S2 in one chain all apply). When amendments from
+    different chains fit at once (two writers amended the same value), the
+    one with the lower row hash applies first. That tie-break is arbitrary,
+    not neutral: a writer can change the hash by rewording the reason. It is
+    only deterministic, and the losing amendment then never fits, so verify
+    fails it until acknowledged (N61) and the gate lists it (N13). An
+    amendment that is malformed or not an allowed change never applies. The
+    lock must pass valid_lock_content.
+    """
+    state: LockContent = copy.deepcopy(dict(locked))
+    pending = [row for row in amend_rows if allowed_change(row)]
+    while True:
+        earliest: dict[object, Mapping[str, Any]] = {}
+        for row in pending:  # pending keeps the input order
+            fits = _same(
+                _amendable_value(state, row["amend"]["key"]), row["amend"]["old"]
+            )
+            if fits:
+                earliest.setdefault(row.get("chain"), row)
+        if not earliest:
+            break
+        chosen = min(earliest.values(), key=lambda row: str(row["hash"]))
+        _apply(state, chosen["amend"])
+        pending = [row for row in pending if row is not chosen]
+    left = {id(row) for row in pending}
+    never = [row for row in amend_rows if id(row) in left or not allowed_change(row)]
+    return state, never
+
+
 def effective_lock(
     locked: Mapping[str, Any], amend_rows: Sequence[Mapping[str, Any]]
 ) -> LockContent:
-    """The locked values with every accepted amendment applied, in the order given.
-
-    [DECISION] Amendments are applied in registry order of chains, then row
-    order, and each replaces the value for its key. Each was checked against
-    the allowed changes when it was written, so nothing is re-checked here.
-    """
-    state: LockContent = copy.deepcopy(dict(locked))
-    for row in amend_rows:
-        amend = row["amend"]
-        if not isinstance(amend, dict):
-            continue
-        key, new = amend.get("key"), amend.get("new")
-        if key == "spec_files" and isinstance(new, dict):
-            state["study"]["spec_files"] = list(new.get("paths", []))
-            state["spec_files"] = dict(new.get("hashes", {}))
-        elif key in ("budget", "prior_trials", "claims", "gate"):
-            if new is None:
-                state["study"].pop(key, None)
-            else:
-                state["study"][key] = new
-    return state
+    """The locked values with every fitting amendment applied (see apply_amendments)."""
+    return apply_amendments(locked, amend_rows)[0]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -163,10 +272,30 @@ def check_amendment(key: str, old: Any, new: Any, fix_commit: str | None) -> Non
         )
     if new == old:
         raise AmendError(f"bgl.toml already matches the lock for {key}; nothing to do")
+    try:
+        _check_change(key, old, new, fix_commit)
+    except TypeError:
+        # [DECISION] A wrongly typed locked or new value (a hand-made row) is
+        # not an allowed change, never a traceback.
+        raise AmendError(
+            f"{key}: {old!r} -> {new!r} is not a change of the right type"
+        ) from None
+
+
+def _texts(value: Any) -> bool:
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def _check_change(key: str, old: Any, new: Any, fix_commit: str | None) -> None:
     if key in _INCREASE_ONLY:
+        # type() rather than isinstance: True == 1 in Python.
+        if type(old) is not int or type(new) is not int:
+            raise TypeError(key)
         if new <= old:
             raise AmendError(f"{key} can only increase (locked {old}, now {new})")
     elif key == "claims":
+        if not _texts(old) or not _texts(new):
+            raise TypeError(key)
         if not set(old) < set(new):
             raise AmendError("claims can only be added, never removed or renamed")
     elif key == "gate":
@@ -222,6 +351,11 @@ def amend_study(
         new = _amendable_value(current, key)
         old = None
         for lock in locks:
+            if not valid_lock_content(lock["lock"]):
+                raise AmendError(
+                    f"the lock row of study {study_name} in chain {lock['chain']} "
+                    "is malformed; run bgl verify"
+                )
             state = effective_lock(lock["lock"], view.events("amend", study_name))
             old = _amendable_value(state, key)
             check_amendment(key, old, new, fix)

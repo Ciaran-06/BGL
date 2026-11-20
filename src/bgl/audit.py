@@ -4,9 +4,12 @@ Python calls an audit hook for every file opened or code object executed
 through the runtime. A hook cannot be removed once installed, so one hook is
 installed on first use and does nothing unless a run is being watched.
 
-What it cannot see (N9, docs/spikes/audit-hook.md): files opened by native
-readers such as pyarrow's own readers and polars, and anything in worker
-processes.
+What it cannot see (N9, docs/audit_hook.md): files opened by native readers
+such as pyarrow's own readers and polars, and anything in worker processes.
+
+sqlite3 opens its database in C, not through Python's open, but Python raises
+a "sqlite3.connect" audit event naming the database, which the hook treats as
+an open (F8).
 """
 
 import contextlib
@@ -15,6 +18,8 @@ import os
 import site
 import sys
 import sysconfig
+import urllib.parse
+import urllib.request
 from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
 from typing import Any, Final
@@ -196,6 +201,47 @@ class Watch:
         }
 
 
+def sqlite_database_path(database: object) -> str | None:
+    """The file a sqlite3.connect call opens, or None for an in-memory database.
+
+    [DECISION] F8, N19 (spec text pending): a "file:" name is read as a URI
+    (path before "?", percent-decoded), whether or not the script passed
+    uri=True. Without uri=True sqlite would open a file literally named
+    "file:...", which the hook then fails to match against declared or
+    guarded files, so the open is still recorded, never hidden. Only ":memory:"
+    and "" (and the same as a URI path) touch no file.
+
+    [DECISION] F8: the query string is never read. A URI that names a path is
+    reported even with mode=memory, because sqlite's own query parsing (the
+    last mode= wins, among other rules) can differ from any parser here, and
+    a mismatch must never hide a file. The cost is a false report for a named
+    in-memory database.
+
+    [DECISION] F8, N9: declared limit. ATTACH DATABASE on an open connection
+    reads a file with no audit event naming it, so the hook cannot see it
+    (docs/audit_hook.md).
+    """
+    try:
+        text = os.fsdecode(database)  # type: ignore[arg-type]
+    except TypeError:
+        return None
+    if text in ("", ":memory:"):
+        return None
+    if not text.startswith("file:"):
+        return text
+    parsed = urllib.parse.urlsplit(text)
+    path = parsed.path
+    if parsed.netloc not in ("", "localhost"):
+        path = "//" + parsed.netloc + path
+    if path in ("", ":memory:"):
+        return None
+    return (
+        urllib.request.url2pathname(path)
+        if path.startswith("/")
+        else (urllib.parse.unquote(path))
+    )
+
+
 _active: Watch | None = None
 _installed = False
 
@@ -207,6 +253,10 @@ def _hook(event: str, args: tuple[Any, ...]) -> None:
     try:
         if event == "open":
             watch.on_open(args[0])
+        elif event == "sqlite3.connect":
+            database = sqlite_database_path(args[0])
+            if database is not None:
+                watch.on_open(database)
         elif event == "exec":
             watch.on_exec(args[0])
         elif event in _PROCESS_EVENTS:

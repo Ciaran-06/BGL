@@ -43,6 +43,7 @@ from bgl.errors import (
     RunError,
     RunInvalid,
     RunRefused,
+    WitnessError,
 )
 from bgl.file_io import atomic_write
 from bgl.ids import DRY_LETTER, LETTER_FOR_TYPE, REFUSED_LETTER, next_run_id
@@ -74,7 +75,10 @@ CONFIG_FILE: Final[str] = "bgl.toml"
 _LOCKS_DIR: Final[str] = ".bgl/locks"
 _TMP_DIR: Final[str] = ".bgl/tmp"
 CLOSE_FORMAT_VERSION: Final[int] = 1
-# Refusals raised before anything could be signed, so nothing was appended.
+# [DECISION] F14, N19 (spec text pending): R19 and R7 refusals write no row.
+# This is forced, not chosen: with no valid identity nothing can be signed, a
+# row on a broken chain would fail verify, and a row from another machine is
+# one verify rejects (F1). The refusal is raised to the script only.
 _UNRECORDED: Final[frozenset[str]] = frozenset({"R19", "R7"})
 
 PathLike = str | os.PathLike[str]
@@ -218,6 +222,7 @@ def gather_facts(root: Path, config: Config, request: Request) -> Facts:
             None if commit is None else git.commit_signature(root, commit)
         ),
         changes=tuple(git.uncommitted_changes(root, exempt)),
+        config_tracked=CONFIG_FILE in tracked,
         script_tracked=request.script in tracked,
         untracked_python=tuple(git.untracked_python(root)),
         untracked_modules=tuple(
@@ -282,6 +287,9 @@ class _Open:
     holdout_load: dict[str, int] | None = None
     read_holdout: bool = False
     fixtures: dict[str, Path] = dataclasses.field(default_factory=dict)
+    open_head: str | None = None  # hash of the open (or dry) row once written
+    # N10: the entry the R23 call returned for open_head, or None.
+    open_witness: dict[str, Any] | None = None
 
 
 class Run:
@@ -292,6 +300,9 @@ class Run:
         self._dry_inputs = dry_inputs
         self._state = "new"  # new -> open -> closed
         self._open_state: _Open | None = None
+        # Set the moment the open (or dry) row is in the chain, so a failure
+        # after it can still close the run (F3).
+        self._written: _Open | None = None
 
     # --- opening -----------------------------------------------------------
 
@@ -351,27 +362,79 @@ class Run:
                     root, config, study, request, facts, view, identity, fixtures, stack
                 )
         except RunRefused as refusal:
+            # Raised only before the open row: _write_open raises no RunRefused.
             stack.close()
             if refusal.rule not in _UNRECORDED:
                 witness.after_append(root, config.project, identity)
             raise
-        except BaseException:
-            stack.close()
+        except BaseException as error:
+            if self._written is None:
+                stack.close()
+            else:
+                self._abort(self._written, error)
             raise
+        try:
+            self._start_body(state)
+        except BaseException as error:
+            self._abort(state, error)
+            raise
+        return state
+
+    def _start_body(self, state: _Open) -> None:
+        """Everything between the open row and the run's code."""
+        root, project = state.root, state.config.project
         # R23: after the open (or dry) row and before the run's code. A failure
         # does not stop the run; the open is then unwitnessed.
-        witness.after_append(root, config.project, identity)
-        if request.dry:
-            audit.start_watching(state.watch)
-            return state
-        if request.counted:
-            output = root / config.project.runs_dir / "output"
+        record = witness.after_append(root, project, state.identity, state.open_head)
+        if record is not None and not state.request.dry:
+            try:
+                state.open_witness = witness.open_witness(record)
+            except WitnessError:
+                state.open_witness = None
+        if state.request.counted and not state.request.dry:
+            output = root / project.runs_dir / "output"
             state.capture = OutputCapture(
                 output / f"{state.run_id}.stdout", output / f"{state.run_id}.stderr"
             )
             state.capture.start()
         audit.start_watching(state.watch)
-        return state
+
+    def _abort(self, state: _Open, error: BaseException) -> None:
+        """F3: a failure after the open row, Ctrl+C included, closes the run.
+
+        The close row says interrupted or crashed (invalid still wins, as at
+        any close) and the caller re-raises. Called at most once per run: the
+        run never reaches the open state, so __exit__ never closes it again.
+
+        [DECISION] A dry run has only its dry row and writes nothing more
+        (R25), so a failure after the dry row just releases what it holds.
+
+        [DECISION] F3: the chain is read to see whether the open row reached
+        it, because the failure may have landed during its append. A close row
+        is written only for an open row that is there, so there is never a
+        close without its open, and never an open left without a close.
+        """
+        audit.stop_watching()
+        closing = False
+        try:
+            if not state.request.dry:
+                closing = self._open_row_written(state)
+                if closing:
+                    self._close(state, error, opening=True)
+        finally:
+            state.stack.close()
+            shutil.rmtree(state.root / _TMP_DIR, ignore_errors=True)
+        if closing:
+            witness.after_append(state.root, state.config.project, state.identity)
+
+    @staticmethod
+    def _open_row_written(state: _Open) -> bool:
+        """True if the writer's verified chain holds this run's open row."""
+        view = read_ledger(state.root, state.config.project)
+        chain = view.report.chains[state.identity.writer.code]
+        return any(
+            row["event"] == "open" and row["id"] == state.run_id for row in chain.rows
+        )
 
     @staticmethod
     def _check_own_chain(view: LedgerView, identity: Identity) -> None:
@@ -539,7 +602,9 @@ class Run:
             # R25: one dry row, written before the body so the attempt is on
             # record whatever the body does. Nothing else is written.
             fields.update(event="dry", status="dry")
-            append_row_unlocked(root, project, identity.writer, key, fields)
+            self._written = state
+            row = append_row_unlocked(root, project, identity.writer, key, fields)
+            state.open_head = row["hash"]
             return state
         lock_file = f"{_LOCKS_DIR}/{run_id}.lock"
         try:
@@ -548,7 +613,9 @@ class Run:
             raise RunError(f"run lock {lock_file} is already held") from error
         if request.counted and not view.has_lock(study.name):
             # R22: the study's first counted open writes the lock row first.
-            assert facts.lock_content is not None
+            # check_r22 has already refused a run whose lock content is missing.
+            if facts.lock_content is None:
+                raise RunError("the study lock's content could not be built")
             append_row_unlocked(
                 root,
                 project,
@@ -596,7 +663,12 @@ class Run:
             manifest_sha256=hashlib.sha256(data).hexdigest(),
             other_heads=view.other_heads(code),
         )
-        append_row_unlocked(root, project, identity.writer, key, fields)
+        # F3: set before the append, so a failure that lands after the row is
+        # on disk but before append_row_unlocked returns (the fsync, say)
+        # still reaches _abort, which looks in the chain for the row.
+        self._written = state
+        row = append_row_unlocked(root, project, identity.writer, key, fields)
+        state.open_head = row["hash"]
         return state
 
     # --- while open --------------------------------------------------------
@@ -740,7 +812,11 @@ class Run:
 
     @staticmethod
     def _status(
-        state: _Open, exc: BaseException | None, invalid: list[str]
+        state: _Open,
+        exc: BaseException | None,
+        invalid: list[str],
+        *,
+        opening: bool = False,
     ) -> tuple[str, str | None]:
         """The close status and its reason.
 
@@ -748,10 +824,17 @@ class Run:
         code or data it may not, however it ended. The error is still kept in
         the close file. sys.exit(0) counts as a normal end; any other exit code
         is a crash.
+
+        [DECISION] F3: a failure after the open row and before the run's code
+        (opening) is interrupted for Ctrl+C and crashed for anything else,
+        sys.exit(0) included: the body never ran, so it cannot have ended well.
         """
         if invalid:
             return "invalid", "; ".join(invalid)
         clean_exit = isinstance(exc, SystemExit) and exc.code in (None, 0)
+        if exc is not None and opening and not isinstance(exc, KeyboardInterrupt):
+            summary_line = f"{type(exc).__name__}: {exc}".splitlines()[0]
+            return "crashed", f"failed after the open row: {summary_line}"
         if exc is None or clean_exit:
             claims = state.request.claims or ()
             undecided = [claim for claim in claims if claim not in state.outcomes]
@@ -768,7 +851,9 @@ class Run:
         summary_line = f"{type(exc).__name__}: {exc}".splitlines()[0]
         return "crashed", summary_line
 
-    def _close(self, state: _Open, exc: BaseException | None) -> tuple[str, str | None]:
+    def _close(
+        self, state: _Open, exc: BaseException | None, *, opening: bool = False
+    ) -> tuple[str, str | None]:
         root, project, run_id = state.root, state.config.project, state.run_id
         if state.capture is not None:
             state.capture.stop()
@@ -782,7 +867,7 @@ class Run:
             invalid.insert(
                 0, f"R17: the run loaded code git does not track: {untracked}"
             )
-        status, reason = self._status(state, exc, invalid)
+        status, reason = self._status(state, exc, invalid, opening=opening)
         runs_dir = root / project.runs_dir
 
         returns_sha: str | None = None
@@ -808,17 +893,29 @@ class Run:
         if state.capture is not None:
             output_record, output_sha = {}, {}
             for name, captured in state.capture.paths.items():
-                digest = hash_file(captured)[1]
-                output_sha[name] = digest
+                # [DECISION] A stream whose file is missing (capture failed to
+                # start, F3) is recorded with null size and hash and left out of
+                # the row, so the close row is still written.
+                size: int | None = None
+                digest: str | None = None
+                if captured.is_file():
+                    size, digest = hash_file(captured)
+                    output_sha[name] = digest
                 output_record[name] = {
                     "file": repo_relative(root, captured),
                     "sha256": digest,
+                    # [DECISION] F9 (spec text pending): the stream's length in
+                    # bytes beside its hash, so the exposure point (holdout_load)
+                    # can be read against the stream's end without the file.
+                    "bytes": size,
                     "holdout_load": (
                         None if state.holdout_load is None else state.holdout_load[name]
                     ),
                 }
 
         error: dict[str, Any] | None = None
+        # [DECISION] F21: the error is kept for crashed runs (the spec) and for
+        # invalid ones, where invalid outranked a crash; Ctrl+C records none.
         if exc is not None and status in ("crashed", "invalid"):
             error = {
                 "type": type(exc).__name__,
@@ -841,6 +938,9 @@ class Run:
             "series": None if state.series is None else summary(state.series),
             "positions": None,
             "outcome": outcome,
+            # [DECISION] N10 (spec text pending): only the R23 call's result,
+            # never an entry obtained later; null when that call failed.
+            "open_witness": state.open_witness,
         }
         close_path = f"{project.runs_dir}/{run_id}.close.json"
         close_bytes = file_bytes(close_file)

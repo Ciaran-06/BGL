@@ -6,9 +6,13 @@ from bgl.errors import AmendError
 from bgl.studylock import (
     AMENDABLE,
     Difference,
+    allowed_change,
+    apply_amendments,
     check_amendment,
     effective_lock,
     lock_differences,
+    valid_amend,
+    valid_lock_content,
 )
 
 
@@ -31,8 +35,22 @@ def content(**study: Any) -> dict[str, Any]:
     }
 
 
-def amend(key: str, new: Any) -> dict[str, Any]:
-    return {"amend": {"key": key, "old": None, "new": new}}
+def amend(
+    key: str,
+    old: Any,
+    new: Any,
+    row_hash: str = "",
+    *,
+    chain: str = "CG1",
+    fix: str | None = None,
+) -> dict[str, Any]:
+    """An amend row as apply_amendments sees it: content, chain, fix and hash."""
+    return {
+        "amend": {"key": key, "old": old, "new": new},
+        "chain": chain,
+        "fix_commit": fix,
+        "hash": row_hash or f"{key}-{old!r}-{new!r}",
+    }
 
 
 def keys(found: list[Difference]) -> list[str]:
@@ -105,20 +123,23 @@ class TestEffectiveLock:
         state["study"]["budget"] = 99
         assert locked["study"]["budget"] == 3
 
-    def test_amendments_apply_in_order(self) -> None:
-        state = effective_lock(content(), [amend("budget", 5), amend("budget", 8)])
+    def test_amendments_chain_on_their_recorded_old(self) -> None:
+        state = effective_lock(
+            content(), [amend("budget", 3, 5), amend("budget", 5, 8)]
+        )
         assert state["study"]["budget"] == 8
 
     def test_each_key(self) -> None:
         gate = {"dsr_threshold": "0.95"}
+        old_spec = {"paths": ["docs/alpha.md"], "hashes": {"docs/alpha.md": "1" * 64}}
         spec = {"paths": ["docs/b.md"], "hashes": {"docs/b.md": "3" * 64}}
         state = effective_lock(
             content(),
             [
-                amend("prior_trials", 4),
-                amend("claims", ["a", "b"]),
-                amend("gate", gate),
-                amend("spec_files", spec),
+                amend("prior_trials", 0, 4),
+                amend("claims", ["a"], ["a", "b"]),
+                amend("gate", None, gate),
+                amend("spec_files", old_spec, spec),
             ],
         )
         assert state["study"]["prior_trials"] == 4
@@ -128,12 +149,144 @@ class TestEffectiveLock:
         assert state["spec_files"] == {"docs/b.md": "3" * 64}
 
     def test_amended_lock_matches_amended_config(self) -> None:
-        state = effective_lock(content(), [amend("budget", 5)])
+        state = effective_lock(content(), [amend("budget", 3, 5)])
         assert lock_differences(state, content(budget=5)) == []
         assert keys(lock_differences(state, content(budget=6))) == ["budget"]
 
     def test_unknown_key_changes_nothing(self) -> None:
-        assert effective_lock(content(), [amend("prefix", "ZZ")]) == content()
+        assert effective_lock(content(), [amend("prefix", "AL", "ZZ")]) == content()
+
+
+class TestApplyByOld:
+    """N13: an amendment applies where its recorded old is the value in force."""
+
+    def test_either_order_gives_the_same_lock(self) -> None:
+        first, second = amend("budget", 3, 5), amend("budget", 5, 8)
+        for rows in ([first, second], [second, first]):
+            state, never = apply_amendments(content(), rows)
+            assert state["study"]["budget"] == 8
+            assert never == []
+
+    def test_one_that_never_fits_is_never_applied(self) -> None:
+        stale = amend("budget", 4, 9)  # the lock says 3, never 4
+        state, never = apply_amendments(content(), [stale])
+        assert state["study"]["budget"] == 3
+        assert never == [stale]
+
+    def test_two_chains_on_the_same_old_lower_hash_wins_in_any_order(self) -> None:
+        low = amend("budget", 3, 9, "a" * 64, chain="CG1")
+        high = amend("budget", 3, 5, "b" * 64, chain="HC1")
+        for rows in ([low, high], [high, low]):
+            state, never = apply_amendments(content(), rows)
+            assert state["study"]["budget"] == 9
+            assert never == [high]
+
+    def test_one_chain_applies_in_its_own_order(self) -> None:
+        """An honest cycle in one chain: S0->S1, S1->S0, S0->S2 all apply.
+
+        The last row has the lowest hash, so a hash tie-break within a chain
+        would apply it first and leave the first two never fitting.
+        """
+        s0 = {"dsr_threshold": "0.9"}
+        s1 = {"dsr_threshold": "0.95"}
+        s2 = {"dsr_threshold": "0.99"}
+        fix = "f" * 40
+        rows = [
+            amend("gate", s0, s1, "c" * 64, fix=fix),
+            amend("gate", s1, s0, "b" * 64, fix=fix),
+            amend("gate", s0, s2, "a" * 64, fix=fix),
+        ]
+        state, never = apply_amendments(content(gate=s0), rows)
+        assert state["study"]["gate"] == s2
+        assert never == []
+
+    def test_old_compares_as_json_not_python(self) -> None:
+        # True == 1 in Python, but a recorded old of {"x": true} is not {"x": 1}.
+        row = amend("gate", {"x": True}, {"x": 2}, fix="f" * 40)
+        state, never = apply_amendments(content(gate={"x": 1}), [row])
+        assert state["study"]["gate"] == {"x": 1}
+        assert never == [row]
+
+    @pytest.mark.parametrize(
+        ("key", "old", "new", "fix"),
+        [
+            ("budget", 3, 2, None),  # a cut
+            ("prior_trials", 0, 0, None),  # no change
+            ("claims", ["a"], [], None),  # a removed claim
+            ("gate", {"x": "1"}, {"x": "2"}, None),  # a correction with no fix
+        ],
+    )
+    def test_a_disallowed_change_never_applies(
+        self, key: str, old: Any, new: Any, fix: str | None
+    ) -> None:
+        """N13, N44: the typed rules are checked again, not only when written."""
+        locked = content(**{key: old})
+        row = amend(key, old, new, fix=fix)
+        state, never = apply_amendments(locked, [row])
+        assert state == locked
+        assert never == [row]
+        assert not allowed_change(row)
+
+    def test_absent_gate_has_old_null(self) -> None:
+        gate = {"dsr_threshold": "0.95"}
+        state, never = apply_amendments(content(), [amend("gate", None, gate)])
+        assert state["study"]["gate"] == gate and never == []
+
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            None,
+            "budget",
+            {"key": "budget", "old": 3},
+            {"key": "budget", "old": 3, "new": 5, "extra": 1},
+            {"key": "budget", "old": 3, "new": "5"},
+            {"key": "budget", "old": 3, "new": True},
+            {"key": "budget", "old": 3, "new": -1},
+            {"key": "claims", "old": ["a"], "new": "a,b"},
+            {"key": "gate", "old": None, "new": [1]},
+            {"key": "spec_files", "old": None, "new": {"paths": []}},
+            {"key": "prefix", "old": "AL", "new": "ZZ"},
+        ],
+    )
+    def test_malformed_content_never_applies(self, bad: Any) -> None:
+        assert not valid_amend(bad)
+        row = {"amend": bad, "hash": "c" * 64}
+        state, never = apply_amendments(content(), [row])
+        assert state == content()
+        assert never == [row]
+
+    def test_does_not_change_the_lock_or_rows(self) -> None:
+        locked, row = content(), amend("claims", ["a"], ["a", "b"])
+        state, _ = apply_amendments(locked, [row])
+        state["study"]["claims"].append("c")
+        assert locked["study"]["claims"] == ["a"]
+        assert row["amend"]["new"] == ["a", "b"]
+
+
+class TestValidLockContent:
+    def test_built_content_is_valid(self) -> None:
+        assert valid_lock_content(content())
+
+    @pytest.mark.parametrize(
+        "change",
+        [
+            lambda c: c.pop("registry"),
+            lambda c: c.update(extra=1),
+            lambda c: c.update(study=[]),
+            lambda c: c["study"].pop("spec_files"),
+            lambda c: c.update(spec_files=["docs/alpha.md"]),
+            lambda c: c["project"].pop("witness"),
+            lambda c: c.update(project="solo"),
+        ],
+    )
+    def test_malformed(self, change: Any) -> None:
+        bad = content()
+        change(bad)
+        assert not valid_lock_content(bad)
+
+    @pytest.mark.parametrize("bad", [None, 1, "lock", []])
+    def test_not_a_mapping(self, bad: Any) -> None:
+        assert not valid_lock_content(bad)
 
 
 class TestCheckAmendment:
@@ -167,6 +320,12 @@ class TestCheckAmendment:
             ("holdout_start", "2025-01-01", "2026-01-01", None, "cannot be amended"),
             ("returns", {}, {"a": 1}, None, "cannot be amended"),
             ("custodian", "a", "b", None, "cannot be amended"),
+            # Wrongly typed values (a hand-made lock or row): never a traceback.
+            ("budget", "3", 4, None, "right type"),
+            ("budget", True, 4, None, "right type"),
+            ("prior_trials", 0, 2.5, None, "right type"),
+            ("claims", "a", ["a", "b"], None, "right type"),
+            ("claims", [["a"]], ["b"], None, "right type"),
         ],
     )
     def test_refused(

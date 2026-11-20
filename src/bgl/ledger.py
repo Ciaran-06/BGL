@@ -16,7 +16,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from bgl.canonical import GENESIS_HASH, HASH_HEX, line_bytes, row_hash
 from bgl.config import Project, Writer
-from bgl.errors import ChainBrokenError, NothingToRepairError
+from bgl.errors import ChainBrokenError, NothingToRepairError, RowRefusedError
 from bgl.ledger_io import (
     append_line,
     chain_files,
@@ -262,6 +262,9 @@ def verify_chain(
                 "machine_id differs from the first row's "
                 "(two machines writing one chain)",
             )
+        wrong = _wrongly_typed(row)
+        if wrong is not None:
+            return fail(number, wrong)
 
         good.append(row)
         prev = row["hash"]  # equal to the hash computed above
@@ -273,6 +276,33 @@ def verify_chain(
             f"torn tail: {len(torn_tail)} bytes after the last complete line",
         )
     return ChainReport(writer.code, tuple(good), prev, None)
+
+
+# [DECISION] F12: the fields every reader uses to group and compare rows must
+# have the spec table's type, so a hand-made row with a list or object there
+# breaks its chain (a finding) instead of every later reader (a traceback).
+# Checked after the signature, so an edit is still reported as an edit, and
+# F1 refuses to write such a row. The other fields are checked where they are
+# used.
+_TEXT_OR_NULL_FIELDS: Final[tuple[str, ...]] = (
+    "id",
+    "study",
+    "type",
+    "sample",
+    "status",
+)
+
+
+def _wrongly_typed(row: Mapping[str, Any]) -> str | None:
+    if not isinstance(row["event"], str):
+        return "event is not text"
+    for name in _TEXT_OR_NULL_FIELDS:
+        if row[name] is not None and not isinstance(row[name], str):
+            return f"{name} is not text or null"
+    variants = row["variants"]
+    if variants is not None and type(variants) is not int:
+        return "variants is not a whole number or null"
+    return None
 
 
 def verify_all_chains(root: Path, project: Project) -> LedgerReport:
@@ -314,9 +344,11 @@ def append_row(
 ) -> dict[str, Any]:
     """The only way a row enters the ledger (R7, R18).
 
-    Verifies the writer's chain under the ledger lock, then builds the row on the
-    verified head and appends it. Raises ChainBrokenError on any problem,
-    including a torn tail, without touching the file.
+    Verifies the writer's chain under the ledger lock, builds the row on the
+    verified head, checks the chain still verifies with the new row (F1), and
+    appends it. Raises ChainBrokenError on any problem with the chain, including
+    a torn tail, and RowRefusedError if the new row would break it, in both
+    cases without touching the file.
     """
     with ledger_lock(root):
         return append_row_unlocked(root, project, writer, private_key, fields)
@@ -341,8 +373,24 @@ def append_row_unlocked(
     if report.problem is not None:
         raise ChainBrokenError(writer.code, report.problem.line, report.problem.reason)
     row = build_row(merged, report.head, private_key)
-    append_line(path, line_bytes(row))
+    append_line(path, _checked_line(lines, row, writer))
     return row
+
+
+def _checked_line(
+    lines: Sequence[bytes], row: Mapping[str, Any], writer: Writer
+) -> bytes:
+    """The row's line, after checking the chain still verifies with it (F1).
+
+    BGL never writes a row verify would reject: a row from a second machine,
+    one with no machine ID, or anything else verify_chain fails. lines must be
+    the chain's complete lines, already verified. Raises RowRefusedError.
+    """
+    data = line_bytes(row)
+    report = verify_chain([*lines, data[:-1]], None, writer)
+    if report.problem is not None:
+        raise RowRefusedError(writer.code, report.problem.line, report.problem.reason)
+    return data
 
 
 def repair_chain(
@@ -376,12 +424,15 @@ def repair_chain(
             "length": len(tail),
             "sha256": hashlib.sha256(tail).hexdigest(),
         }
+        row = build_row(merged, report.head, private_key)
+        # F1: the repair row is checked before the tail is touched, so a
+        # refused repair (say from a second machine) leaves the file as it was.
+        data = _checked_line(lines, row, writer)
         # [DECISION] A crash between truncating and appending leaves a clean
         # chain with no repair row. Accepted: the removed bytes were never a
         # complete signed row, so no evidence is lost.
         truncate_tail(path, len(tail))
-        row = build_row(merged, report.head, private_key)
-        append_line(path, line_bytes(row))
+        append_line(path, data)
     return row
 
 

@@ -14,7 +14,7 @@ from bgl.records import (
     trials_n,
 )
 from bgl.verify import OpenRuns, find_open_runs, this_machine_id
-from bgl.witness import ChainWitness, chain_witness, unwitnessed_opens
+from bgl.witness import ChainWitness, chain_witness, classify_opens
 
 CONFIG_FILE: Final[str] = "bgl.toml"
 
@@ -33,6 +33,8 @@ class StudyStatus:
     unclosed: tuple[str, ...]
     in_progress: tuple[str, ...]
     unwitnessed: tuple[str, ...]
+    # N11: witnessed by stored records only, not checked against the log.
+    witnessed_offline: tuple[str, ...] = ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -70,9 +72,11 @@ def _witness_text(chain: ChainWitness | None, witnessing: bool) -> str:
         return "off (witness = false)"
     if chain is None:
         return "no records"
+    # N11: these counts come from the stored records and proofs.
     text = (
         f"{len(chain.logged)}/{chain.heads} heads in Rekor, "
-        f"{len(chain.stamped)} stamped ({len(chain.confirmed)} confirmed in Bitcoin)"
+        f"{len(chain.stamped)} stamped ({len(chain.confirmed)} confirmed in Bitcoin), "
+        "from stored records, not checked against the log"
     )
     if chain.problems:
         text += f"; {len(chain.problems)} problem(s), see bgl verify"
@@ -87,9 +91,13 @@ def project_status(root: Path) -> ProjectStatus:
         open_runs: OpenRuns = find_open_runs(root, view, this_machine_id())
     witnessed = {w.code: w for w in chain_witness(root, config.project, view)}
     witnessing = config.project.witness is not None
-    unwitnessed = (
-        set(unwitnessed_opens(view, witnessed.values())) if witnessing else set()
-    )
+    unwitnessed: set[str] = set()
+    witnessed_offline: set[str] = set()
+    if witnessing:
+        opens = classify_opens(
+            root, config.project, view, witnessed.values(), open_runs.in_progress
+        )
+        unwitnessed, witnessed_offline = set(opens.unwitnessed), set(opens.witnessed)
     studies = []
     for name, study in config.studies.items():
         ids = {row["id"] for row in view.opens(name)}
@@ -112,6 +120,7 @@ def project_status(root: Path) -> ProjectStatus:
                 ),
                 in_progress=tuple(r for r in open_runs.in_progress if r in ids),
                 unwitnessed=tuple(sorted(unwitnessed & ids)),
+                witnessed_offline=tuple(sorted(witnessed_offline & ids)),
             )
         )
     chains = tuple(

@@ -26,6 +26,22 @@ class ChainBrokenError(LedgerError):
         )
 
 
+class RowRefusedError(LedgerError):
+    """F1: the new row itself would fail verification, so it was not written.
+
+    For example a row from a second machine, or one with no machine ID.
+    """
+
+    def __init__(self, code: str, line: int, reason: str) -> None:
+        self.code = code
+        self.line = line
+        self.reason = reason
+        super().__init__(
+            f"R7: the new row would break chain {code} at line {line}: {reason}. "
+            "Nothing was written"
+        )
+
+
 class NothingToRepairError(LedgerError):
     """bgl repair was asked to fix a chain with no torn tail."""
 

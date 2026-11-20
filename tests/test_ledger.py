@@ -1,18 +1,22 @@
+import base64
 import hashlib
 import json
 import subprocess
 import sys
+import tempfile
 import textwrap
 from pathlib import Path
 from typing import Any
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from bgl import ledger
 from bgl.canonical import GENESIS_HASH, line_bytes, row_hash
 from bgl.config import Project, Writer
-from bgl.errors import ChainBrokenError, NothingToRepairError
+from bgl.errors import ChainBrokenError, NothingToRepairError, RowRefusedError
 from bgl.ledger import (
     BUILD_ONLY_FIELDS,
     EVENTS,
@@ -46,10 +50,86 @@ def note(**extra: Any) -> dict[str, Any]:
 
 class TestConstants:
     def test_row_fields_match_spec_table(self) -> None:
+        # Copied by hand from the spec's field table (File formats, Ledger).
+        assert ROW_FIELDS == {
+            "id",
+            "legacy_id",
+            "event",
+            "chain",
+            "study",
+            "type",
+            "claims",
+            "selects",
+            "variants",
+            "sample",
+            "sample_start",
+            "sample_end",
+            "script",
+            "script_sha256",
+            "code_sha256",
+            "config_sha256",
+            "inputs_sha256",
+            "what_changed",
+            "prediction",
+            "status",
+            "outcome",
+            "result",
+            "commit",
+            "user",
+            "commit_signature",
+            "machine_id",
+            "host",
+            "pid",
+            "lock_file",
+            "started",
+            "ended",
+            "manifest",
+            "manifest_sha256",
+            "close_file",
+            "close_sha256",
+            "returns_sha256",
+            "output_sha256",
+            "other_heads",
+            "reason",
+            "fix_commit",
+            "amend",
+            "lock",
+            "seal",
+            "removed",
+            "period",
+            "value",
+            "turnover",
+            "cost",
+            "position_sha256",
+            "live_inputs",
+            "report_sha256",
+            "format_version",
+            "prev_hash",
+            "hash",
+            "sig",
+        }
         assert len(ROW_FIELDS) == 55
 
     def test_events(self) -> None:
-        assert len(EVENTS) == 16
+        # Copied by hand from the spec's event list (File formats, Ledger).
+        assert EVENTS == {
+            "open",
+            "close",
+            "refused",
+            "dry",
+            "note",
+            "ack",
+            "void",
+            "lock",
+            "amend",
+            "repair",
+            "seal",
+            "imported",
+            "incubation",
+            "live_return",
+            "gate",
+            "registration",
+        }
 
     def test_build_only_fields_are_row_fields(self) -> None:
         assert BUILD_ONLY_FIELDS <= ROW_FIELDS
@@ -596,3 +676,227 @@ class TestRepairChain:
         with pytest.raises(ValueError):
             repair_chain(tmp_path, solo_project(), WRITER, KEY, fields)
         assert chain_file(tmp_path).read_bytes() == before
+
+
+class TestFieldTypes:
+    """F12: fields readers group and compare by must have their table type."""
+
+    @pytest.mark.parametrize(
+        ("field", "value", "reason"),
+        [
+            ("id", ["AL-R001-CG1"], "id is not text or null"),
+            ("id", {"run": 1}, "id is not text or null"),
+            ("study", ["alpha"], "study is not text or null"),
+            ("type", 1, "type is not text or null"),
+            ("sample", {}, "sample is not text or null"),
+            ("status", [], "status is not text or null"),
+            ("variants", "2", "variants is not a whole number or null"),
+            ("variants", True, "variants is not a whole number or null"),
+        ],
+    )
+    def test_wrong_type_breaks_the_chain(
+        self, field: str, value: object, reason: str
+    ) -> None:
+        row = build_row(note(**{field: value}), GENESIS_HASH, KEY)
+        assert problem_of(verify_chain([as_line(row)], None, WRITER)) == (1, reason)
+
+    def test_event_must_be_text(self) -> None:
+        row = build_row(note(), GENESIS_HASH, KEY)
+        row["event"] = ["note"]
+        row["hash"] = row_hash(row)
+        row["sig"] = ledger.sign_row_hash(KEY, row["hash"])
+        assert problem_of(verify_chain([as_line(row)], None, WRITER)) == (
+            1,
+            "event is not text",
+        )
+
+    @pytest.mark.parametrize("value", [None, "AL-R001-CG1"])
+    def test_text_or_null_passes(self, value: object) -> None:
+        row = build_row(note(id=value, variants=2), GENESIS_HASH, KEY)
+        assert verify_chain([as_line(row)], None, WRITER).problem is None
+
+    def test_bgl_refuses_to_write_one(self, tmp_path: Path) -> None:
+        with pytest.raises(RowRefusedError, match="id is not text or null"):
+            append_row(tmp_path, solo_project(), WRITER, KEY, note(id=["x"]))
+        assert not chain_file(tmp_path).exists()
+
+
+class TestNoRowVerifyWouldReject:
+    """F1: the chain is verified with the new row before anything is written."""
+
+    @pytest.mark.parametrize(
+        ("machine", "reason"),
+        [
+            pytest.param("m2", "machine_id differs", id="second_machine"),
+            pytest.param(None, "machine_id missing", id="null"),
+            pytest.param("", "machine_id missing", id="empty"),
+            pytest.param(7, "machine_id missing", id="not_text"),
+        ],
+    )
+    def test_append_refused_and_file_unchanged(
+        self, tmp_path: Path, machine: object, reason: str
+    ) -> None:
+        before = b"".join(line_bytes(r) for r in good_rows(2))
+        write_chain(tmp_path, before)
+        with pytest.raises(RowRefusedError, match=reason) as info:
+            append_row(tmp_path, solo_project(), WRITER, KEY, note(machine_id=machine))
+        assert info.value.line == 3
+        assert chain_file(tmp_path).read_bytes() == before
+
+    def test_first_row_without_machine_id_is_refused(self, tmp_path: Path) -> None:
+        fields = note()
+        del fields["machine_id"]
+        with pytest.raises(RowRefusedError, match="machine_id missing"):
+            append_row(tmp_path, solo_project(), WRITER, KEY, fields)
+        assert not chain_file(tmp_path).exists()
+
+    def test_row_signed_by_another_key_is_refused(self, tmp_path: Path) -> None:
+        with pytest.raises(RowRefusedError, match="signature"):
+            append_row(tmp_path, solo_project(), WRITER, OTHER_KEY, note())
+        assert not chain_file(tmp_path).exists()
+
+    @pytest.mark.parametrize("machine", ["m2", None])
+    def test_repair_refused_and_tail_kept(
+        self, tmp_path: Path, machine: object
+    ) -> None:
+        before = b"".join(line_bytes(r) for r in good_rows(2)) + b'{"torn'
+        write_chain(tmp_path, before)
+        with pytest.raises(RowRefusedError):
+            repair_chain(tmp_path, solo_project(), WRITER, KEY, {"machine_id": machine})
+        assert chain_file(tmp_path).read_bytes() == before
+
+
+# --- property tests (Hypothesis) ---------------------------------------------
+
+_TEXT = st.text(alphabet=st.characters(blacklist_categories=("Cs",)), max_size=20)
+_ROW_FIELDS = st.fixed_dictionaries(
+    {"reason": _TEXT},
+    optional={
+        "pid": st.integers(min_value=-(2**40), max_value=2**40),
+        "claims": st.lists(_TEXT, max_size=3),
+        "amend": st.dictionaries(_TEXT, st.one_of(st.none(), st.booleans(), _TEXT)),
+        "event": st.sampled_from(sorted(EVENTS)),
+    },
+)
+
+
+def chain_bytes(field_sets: list[dict[str, Any]]) -> tuple[bytes, list[dict[str, Any]]]:
+    rows: list[dict[str, Any]] = []
+    prev = GENESIS_HASH
+    for fields in field_sets:
+        row = build_row(note(**fields), prev, KEY)
+        rows.append(row)
+        prev = row["hash"]
+    return b"".join(line_bytes(row) for row in rows), rows
+
+
+def verify_bytes(data: bytes) -> ChainReport:
+    """verify_chain on file bytes, split exactly as ledger_io.read_chain does."""
+    parts = data.split(b"\n")
+    tail = parts.pop()
+    return verify_chain(parts, tail or None, WRITER)
+
+
+class TestProperties:
+    @settings(max_examples=60, deadline=None)
+    @given(st.lists(_ROW_FIELDS, max_size=6))
+    def test_any_valid_sequence_verifies(
+        self, field_sets: list[dict[str, Any]]
+    ) -> None:
+        data, rows = chain_bytes(field_sets)
+        report = verify_bytes(data)
+        assert report.problem is None
+        assert [row["hash"] for row in report.rows] == [row["hash"] for row in rows]
+
+    @settings(max_examples=15, deadline=None)
+    @given(st.lists(_ROW_FIELDS, min_size=1, max_size=4))
+    def test_any_valid_sequence_of_appends_verifies(
+        self, field_sets: list[dict[str, Any]]
+    ) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            for fields in field_sets:
+                append_row(root, solo_project(), WRITER, KEY, note(**fields))
+            assert len(file_verifies(root).rows) == len(field_sets)
+
+    @settings(max_examples=200, deadline=None)
+    @given(
+        st.lists(_ROW_FIELDS, min_size=1, max_size=4),
+        st.data(),
+    )
+    def test_any_single_byte_change_fails(
+        self, field_sets: list[dict[str, Any]], data: st.DataObject
+    ) -> None:
+        original, _ = chain_bytes(field_sets)
+        kind = data.draw(st.sampled_from(["replace", "delete", "insert"]))
+        at = data.draw(st.integers(0, len(original) - (kind != "insert")))
+        if kind == "replace":
+            byte = data.draw(st.integers(0, 255).filter(lambda b: b != original[at]))
+            changed = original[:at] + bytes([byte]) + original[at + 1 :]
+        elif kind == "delete":
+            changed = original[:at] + original[at + 1 :]
+        else:
+            byte = data.draw(st.integers(0, 255))
+            changed = original[:at] + bytes([byte]) + original[at:]
+        assert verify_bytes(changed).problem is not None
+
+    @settings(max_examples=100, deadline=None)
+    @given(st.lists(_ROW_FIELDS, min_size=1, max_size=4), st.data())
+    def test_any_respelling_of_the_same_row_fails(
+        self, field_sets: list[dict[str, Any]], data: st.DataObject
+    ) -> None:
+        """Changes random bytes rarely hit: the row parses the same, spelt otherwise.
+
+        A space after a separator, an escaped character, or a signature whose
+        base64 has non-zero padding bits all decode to the same row and the
+        same signature bytes. Each line has exactly one valid spelling.
+        """
+        original, rows = chain_bytes(field_sets)
+        lines = original.split(b"\n")[:-1]
+        index = data.draw(st.integers(0, len(lines) - 1))
+        line = lines[index]
+        kind = data.draw(st.sampled_from(["space", "escape", "sig_padding"]))
+        if kind == "space":
+            # Only spots that are structural whatever the strings hold: after
+            # the opening brace, or before the closing one.
+            at = data.draw(st.sampled_from([1, len(line) - 1]))
+            line = line[:at] + b" " + line[at:]
+            assert json.loads(line) == rows[index]
+        elif kind == "escape":
+            # The first letter of the "event" key, written as e.
+            line = line.replace(b'"event"', b'"\\u0065vent"', 1)
+            assert json.loads(line) == rows[index]
+        else:
+            sig = rows[index]["sig"]
+            assert sig.endswith("==")
+            alphabet = (
+                "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+            )
+            value = alphabet.index(sig[-3])
+            low = data.draw(st.integers(1, 15))  # bits a decoder ignores
+            respelt = sig[:-3] + alphabet[(value & ~15) | low] + "=="
+            assert base64.b64decode(respelt) == base64.b64decode(sig)
+            line = line.replace(sig.encode(), respelt.encode())
+        lines[index] = line
+        changed = b"".join(item + b"\n" for item in lines)
+        assert verify_bytes(changed).problem is not None
+
+    @settings(max_examples=200, deadline=None)
+    @given(
+        st.lists(_ROW_FIELDS, min_size=1, max_size=4),
+        st.data(),
+    )
+    def test_any_single_field_change_fails(
+        self, field_sets: list[dict[str, Any]], data: st.DataObject
+    ) -> None:
+        _, rows = chain_bytes(field_sets)
+        index = data.draw(st.integers(0, len(rows) - 1))
+        field = data.draw(st.sampled_from(sorted(ROW_FIELDS)))
+        value = data.draw(
+            st.one_of(st.none(), st.booleans(), st.integers(), _TEXT).filter(
+                lambda v: json.dumps(v) != json.dumps(rows[index][field])
+            )
+        )
+        rows[index] = {**rows[index], field: value}
+        changed = b"".join(line_bytes(row) for row in rows)
+        assert verify_bytes(changed).problem is not None

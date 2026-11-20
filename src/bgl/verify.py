@@ -19,7 +19,15 @@ from bgl.home import home_dir, load_machine_id
 from bgl.locks import file_lock, ledger_lock
 from bgl.records import LedgerView, Row, read_ledger_unlocked
 from bgl.setup import sync_warning
-from bgl.studylock import effective_lock, lock_content, lock_differences
+from bgl.studylock import (
+    allowed_change,
+    apply_amendments,
+    effective_lock,
+    lock_content,
+    lock_differences,
+    valid_amend,
+    valid_lock_content,
+)
 from bgl.witness import chain_witness
 
 CONFIG_FILE: Final[str] = "bgl.toml"
@@ -76,6 +84,11 @@ def _safe_relative(path: object) -> str | None:
     return tidy
 
 
+def _study_rows(view: LedgerView, event: str, study: object) -> list[Row]:
+    """Rows of one event for exactly this study (a malformed row's may be null)."""
+    return [row for row in view.events(event) if row["study"] == study]
+
+
 def find_open_runs(root: Path, view: LedgerView, machine_id: str | None) -> OpenRuns:
     """Classify every open row without a close row. Call under the ledger lock.
 
@@ -96,6 +109,9 @@ def find_open_runs(root: Path, view: LedgerView, machine_id: str | None) -> Open
             continue
         lock = _safe_relative(row["lock_file"])
         if lock is None or not lock.startswith(_LOCKS_PREFIX):
+            # [DECISION] F21: an open row whose lock_file is not a path under
+            # .bgl/locks/ has no lock verify may take, so it counts as unclosed
+            # (a failure), never as in progress.
             unclosed.append(run_id)
             continue
         try:
@@ -108,17 +124,57 @@ def find_open_runs(root: Path, view: LedgerView, machine_id: str | None) -> Open
 
 def _pairing(view: LedgerView, open_runs: OpenRuns) -> list[Finding]:
     failures: list[Finding] = []
-    opened = {row["id"] for row in view.events("open")}
+    opens: dict[str, list[Row]] = {}
+    for row in view.events("open"):
+        opens.setdefault(row["id"], []).append(row)
+    # F12: a run ID is opened once (R16), in whichever chain.
+    for run_id, rows in opens.items():
+        if len(rows) > 1:
+            where = ", ".join(sorted(str(row["chain"]) for row in rows))
+            failures.append(
+                Finding("pairing", f"{run_id} has {len(rows)} open rows ({where})")
+            )
     acked = {row["id"] for row in view.events("ack")}
     closes: dict[str, list[Row]] = {}
     for row in view.events("close"):
         closes.setdefault(row["id"], []).append(row)
     for run_id, rows in closes.items():
-        if run_id not in opened:
+        if run_id not in opens:
             failures.append(
                 Finding("pairing", f"close row for {run_id} has no open row")
             )
         normal = [row for row in rows if row["status"] != _ABANDONED]
+        for row in rows:
+            # [DECISION] N10, F12: the spec makes close_file null only on
+            # abandoned closes. A normal close without one hides its
+            # open_witness and close record, and an abandoned close with one
+            # claims a record no abandon writes; both fail.
+            if (row["close_file"] is None) != (row["status"] == _ABANDONED):
+                failures.append(
+                    Finding(
+                        "pairing",
+                        f"{run_id} has a {row['status']} close row in chain "
+                        f"{row['chain']} "
+                        + (
+                            "with no close file"
+                            if row["close_file"] is None
+                            else "with a close file"
+                        )
+                        + "; close_file is null exactly on abandoned closes",
+                    )
+                )
+        # F12: the run's own process writes its normal close, in its own chain.
+        # Only an abandon may come from another writer's chain.
+        own_chains = {row["chain"] for row in opens.get(run_id, [])}
+        for row in normal:
+            if own_chains and row["chain"] not in own_chains:
+                failures.append(
+                    Finding(
+                        "pairing",
+                        f"{run_id} has a normal close row in chain {row['chain']}, "
+                        "outside the chain that opened it",
+                    )
+                )
         if len(normal) > 1:
             failures.append(
                 Finding("pairing", f"{run_id} has {len(normal)} close rows")
@@ -216,7 +272,13 @@ def _file_hashes(
                     committed=False,
                 )
             )
-        for stream, digest in (row["output_sha256"] or {}).items():
+        streams = row["output_sha256"] or {}
+        if not isinstance(streams, dict) or not set(streams) <= {"stdout", "stderr"}:
+            # [DECISION] Malformed row content is a finding, never a traceback
+            # or a path built from it (F12).
+            add(Finding("hash", f"close row of {run_id}: malformed output_sha256"))
+            continue
+        for stream, digest in streams.items():
             add(
                 _check_file(
                     root,
@@ -298,12 +360,117 @@ def _commits(root: Path, view: LedgerView) -> list[Finding]:
     ]
 
 
+def _acked_amendments(
+    view: LedgerView,
+) -> tuple[set[tuple[object, str]], list[Finding]]:
+    """(study, amend row hash) pairs that ack rows name, and malformed acks (N61).
+
+    [DECISION] N61 (spec text pending): an ack row names an amendment by
+    {"row": hash} in its amend field, with id null and the amendment's study.
+    It counts only for an amendment of that study. Any other non-null amend
+    content on an ack row is malformed (F12).
+    """
+    acked: set[tuple[object, str]] = set()
+    malformed: list[Finding] = []
+    amendments = {(row["study"], row["hash"]) for row in view.events("amend")}
+    for row in view.events("ack"):
+        amend = row["amend"]
+        if amend is None:
+            continue  # an ack of a late close names the run in id
+        if (
+            isinstance(amend, dict)
+            and set(amend) == {"row"}
+            and isinstance(amend["row"], str)
+            and HASH_HEX.fullmatch(amend["row"])
+            and row["id"] is None
+        ):
+            named = (row["study"], amend["row"])
+            acked.add(named)
+            if named not in amendments:
+                # [DECISION] N61: an ack that names no amend row of its study
+                # here is a finding, so a mistyped hash cannot pass for a
+                # review that never happened.
+                malformed.append(
+                    Finding(
+                        "amend",
+                        f"ack row {row['hash']} in chain {row['chain']} names "
+                        f"{amend['row']}, which is no amend row of study "
+                        f"{row['study']} in the chains here",
+                    )
+                )
+        else:
+            malformed.append(
+                Finding(
+                    "amend",
+                    f"ack row {row['hash']} in chain {row['chain']} has malformed "
+                    'amend content; it must be {"row": HASH} with id null',
+                )
+            )
+    return acked, malformed
+
+
+def _amendments(view: LedgerView) -> list[Finding]:
+    """N13: every amendment that never fits its lock fails until acknowledged.
+
+    [DECISION] With more than one lock row for a study, an amendment that fits
+    one lock but not another still never fits that one, so it is reported.
+    An amendment of a study with no lock row here fits nothing. A malformed
+    amendment never fits either (F12): it is reported as malformed and, like
+    any amendment that never applied, clears once an ack names it (N13).
+    """
+    acked, failures = _acked_amendments(view)
+    for row in view.events("amend"):
+        if not valid_amend(row["amend"]) and (row["study"], row["hash"]) not in acked:
+            failures.append(
+                Finding(
+                    "amend",
+                    f"amend row {row['hash']} in chain {row['chain']} has malformed "
+                    "content (expected {key, old, new} for an amendable key). "
+                    f"It never applies; acknowledge it with bgl ack {row['hash']} "
+                    '"reason"',
+                )
+            )
+    studies = sorted({row["study"] for row in view.events("amend")}, key=str)
+    for name in studies:
+        amends = [row for row in view.events("amend") if row["study"] == name]
+        locks = [
+            lock
+            for lock in _study_rows(view, "lock", name)
+            if valid_lock_content(lock["lock"])
+        ]
+        never: dict[str, Row] = {}
+        if not _study_rows(view, "lock", name):
+            never = {str(row["hash"]): row for row in amends}
+        for lock in locks:
+            for row in apply_amendments(lock["lock"], amends)[1]:
+                never[str(row["hash"])] = row
+        for row_hash, row in never.items():
+            if (row["study"], row_hash) in acked or not valid_amend(row["amend"]):
+                continue  # malformed ones are reported above
+            amend = row["amend"]
+            why = (
+                "never fits the value in force"
+                if allowed_change(row)
+                else "is not an allowed change"
+            )
+            failures.append(
+                Finding(
+                    "amend",
+                    f"amendment {row_hash} of study {name} (key {amend['key']}, "
+                    f"recorded old {amend['old']!r}) {why}, so it was never "
+                    "applied. Review it and acknowledge it with "
+                    f'bgl ack {row_hash} "reason"',
+                )
+            )
+    return failures
+
+
 def _locks(
     root: Path, config: Config, view: LedgerView
 ) -> tuple[list[Finding], list[Finding]]:
     failures: list[Finding] = []
     warnings: list[Finding] = []
-    locked = sorted({row["study"] for row in view.events("lock")})
+    locked = sorted({row["study"] for row in view.events("lock")}, key=str)
     if not locked:
         return failures, warnings
     try:
@@ -311,6 +478,17 @@ def _locks(
     except GitError as error:
         return [Finding("lock", str(error))], warnings
     for name in locked:
+        lock_rows = _study_rows(view, "lock", name)
+        for lock in lock_rows:
+            if not valid_lock_content(lock["lock"]):
+                # F12: a finding, never a traceback.
+                failures.append(
+                    Finding(
+                        "lock",
+                        f"lock row {lock['hash']} of study {name} in chain "
+                        f"{lock['chain']} has malformed content",
+                    )
+                )
         study = config.studies.get(name)
         if study is None:
             failures.append(
@@ -324,10 +502,12 @@ def _locks(
         except LockError as error:
             failures.append(Finding("lock", f"study {name}: {error}"))
             continue
-        amends = view.events("amend", name)
+        amends = _study_rows(view, "amend", name)
         hard: dict[str, None] = {}
         spec_changed = False
-        for lock in view.events("lock", name):
+        for lock in lock_rows:
+            if not valid_lock_content(lock["lock"]):
+                continue
             for difference in lock_differences(
                 effective_lock(lock["lock"], amends), current
             ):
@@ -407,6 +587,7 @@ def verify_project(root: Path, *, contains: str | None = None) -> VerifyReport:
     lock_failures, lock_warnings = _locks(root, config, view)
     failures.extend(lock_failures)
     warnings.extend(lock_warnings)
+    failures.extend(_amendments(view))
     found: tuple[str, ...] | None = None
     if contains is not None:
         found = _contains(view, contains)
